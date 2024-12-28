@@ -1,0 +1,8 @@
+{
+  "v": 2,
+  "key": {
+    "expireAt": 1
+  },
+  "name": "expireAt_1",
+  "expireAfterSeconds": 30
+}

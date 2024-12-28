@@ -1,0 +1,25 @@
+{
+  "name": "signal_barrier",
+  "type": "collection",
+  "options": {
+    "changeStreamPreAndPostImages": {
+      "enabled": true
+    }
+  },
+  "info": {
+    "readOnly": false,
+    "uuid": {
+      "$binary": {
+        "base64": "ouh+s3VUTduftXHUhM3y3A==",
+        "subType": "04"
+      }
+    }
+  },
+  "idIndex": {
+    "v": 2,
+    "key": {
+      "_id": 1
+    },
+    "name": "_id_"
+  }
+}

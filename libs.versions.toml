@@ -1,0 +1,29 @@
+[versions]
+guava = "33.3.1-jre"
+mongo-driver = "5.2.1"
+autovalue = "1.11.0"
+autoservice = "1.1.1"
+failsafe = "3.3.2"
+lettuce = "6.5.0.RELEASE"
+slf4j = "2.0.15"
+logback = "1.5.7"
+systemrule = "1.19.0"
+bytebuddy = "1.15.11"
+
+
+[libraries]
+autovalueannotations = { module = "com.google.auto.value:auto-value-annotations", version.ref = "autovalue" }
+autovalue = { module = "com.google.auto.value:auto-value", version.ref = "autovalue" }
+autoserviceannotations = { module = "com.google.auto.service:auto-service-annotations", version.ref = "autoservice" }
+autoservice = { module = "com.google.auto.service:auto-service", version.ref = "autoservice" }
+guava = { module = "com.google.guava:guava", version.ref = "guava" }
+mongodriver = { module = "org.mongodb:mongodb-driver-sync", version.ref = "mongo-driver" }
+failsafe = { module = "dev.failsafe:failsafe", version.ref = "failsafe" }
+lettucecore = { module = "io.lettuce:lettuce-core", version.ref = "lettuce" }
+slf4j = { module = "org.slf4j:slf4j-api", version.ref = "slf4j" }
+logback = { module = "ch.qos.logback:logback-classic", version.ref = "logback" }
+systemrule = { module = "com.github.stefanbirkner:system-rules", version.ref = "systemrule" }
+bytebuddy = { module = "net.bytebuddy:byte-buddy", version.ref = "bytebuddy" }
+bytebuddyagent = { module = "net.bytebuddy:byte-buddy-agent", version.ref = "bytebuddy" }
+
+[bundles]
