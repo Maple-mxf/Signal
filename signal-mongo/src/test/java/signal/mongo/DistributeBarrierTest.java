@@ -42,10 +42,11 @@ public class DistributeBarrierTest extends BaseResourceSetup {
     while (concurrency != barrier.getHoldCount()) {
       Thread.onSpinWait();
     }
-    TimeUnit.SECONDS.sleep(12L);
+    TimeUnit.SECONDS.sleep(3L);
     barrier.removeBarrier();
     LOGGER.debug("Barrier has been removed.");
-
+    TimeUnit.SECONDS.sleep(1L);
     lease.revoke();
+    // TimeUnit.SECONDS.sleep(2L);
   }
 }

@@ -36,6 +36,7 @@ import com.google.common.eventbus.EventBus;
 import com.google.common.eventbus.Subscribe;
 import com.google.errorprone.annotations.CheckReturnValue;
 import com.google.errorprone.annotations.DoNotCall;
+import com.google.errorprone.annotations.Keep;
 import com.google.errorprone.annotations.ThreadSafe;
 import com.google.errorprone.annotations.concurrent.GuardedBy;
 import com.mongodb.client.ClientSession;
@@ -89,9 +90,10 @@ public final class DistributeMutexLockImp extends DistributeMongoSignalBase
   private final ReentrantLock lock;
   private final Condition available;
 
+  @Keep
   @GuardedBy("varHandle")
   @VisibleForTesting
-  final StateVars<Boolean> stateVars;
+  StateVars<Boolean> stateVars;
 
   private final VarHandle varHandle;
 

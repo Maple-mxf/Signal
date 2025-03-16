@@ -38,6 +38,7 @@ import com.google.errorprone.annotations.ThreadSafe;
 @ThreadSafe
 public interface DistributeBarrier extends DistributeSignal, Shared {
 
+
   /** 设置障碍点 */
   void setBarrier();
 

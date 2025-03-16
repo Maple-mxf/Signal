@@ -9,6 +9,7 @@ import static com.mongodb.client.model.Projections.computed;
 import static com.mongodb.client.model.Projections.excludeId;
 import static com.mongodb.client.model.Projections.fields;
 import static com.mongodb.client.model.Updates.addToSet;
+import static com.mongodb.client.model.Updates.combine;
 import static com.mongodb.client.model.Updates.inc;
 import static java.util.Collections.emptySet;
 import static java.util.Optional.ofNullable;
@@ -19,19 +20,20 @@ import static signal.mongo.MongoErrorCode.LockFailed;
 import static signal.mongo.MongoErrorCode.LockTimeout;
 import static signal.mongo.MongoErrorCode.NoSuchTransaction;
 import static signal.mongo.MongoErrorCode.WriteConflict;
+import static signal.mongo.TxnResponse.ok;
+import static signal.mongo.TxnResponse.parkThreadWithSuccess;
+import static signal.mongo.TxnResponse.retryableError;
 
 import com.google.auto.service.AutoService;
 import com.google.common.collect.ImmutableList;
 import com.google.common.eventbus.EventBus;
 import com.google.common.eventbus.Subscribe;
-import com.google.errorprone.annotations.CompileTimeConstant;
 import com.google.errorprone.annotations.DoNotCall;
 import com.google.errorprone.annotations.ThreadSafe;
 import com.mongodb.client.ClientSession;
 import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoCollection;
 import com.mongodb.client.MongoDatabase;
-import com.mongodb.client.model.Updates;
 import com.mongodb.client.result.DeleteResult;
 import java.util.Collection;
 import java.util.concurrent.locks.Condition;
@@ -72,23 +74,18 @@ public final class DistributeBarrierImp extends DistributeMongoSignalBase
     implements DistributeBarrier {
 
   enum BarrierState {
-    WAIT
+    NONE,
+    SET,
+    WAIT,
+    RELEASE
   }
 
   private final ReentrantLock lock;
   private final Condition removed;
   private final EventBus eventBus;
 
-  // private final StateVars<BarrierState>
-
-  // private final VarHandle varHandle;
-
   public DistributeBarrierImp(
-      Lease lease,
-      @CompileTimeConstant String key,
-      MongoClient mongoClient,
-      MongoDatabase db,
-      EventBus eventBus) {
+      Lease lease, String key, MongoClient mongoClient, MongoDatabase db, EventBus eventBus) {
     super(lease, key, mongoClient, db, BARRIER_NAMED);
     this.lock = new ReentrantLock();
     this.removed = lock.newCondition();
@@ -113,50 +110,55 @@ public final class DistributeBarrierImp extends DistributeMongoSignalBase
                 LockTimeout, LockBusy, LockFailed, NoSuchTransaction),
             null,
             _unused -> false);
-    if (!success) {
-
-    }
+    if (!success) throw new SignalException("Set barrier failure.");
   }
 
   @Override
   public void waitOnBarrier() throws InterruptedException {
     checkState();
+    TxnResponse txnResponse;
+    while ((txnResponse = this.doWaitOnBarrier()).txnOk
+        && !txnResponse.thrownError
+        && txnResponse.parkThread) {
+      // 循环检查当前线程是否需要await,避免JVM虚假唤醒
+      lock.lock();
+      try {
+        removed.await();
+      } finally {
+        lock.unlock();
+      }
+    }
+    if (txnResponse.thrownError) throw new SignalException(txnResponse.message);
+  }
+
+  private TxnResponse doWaitOnBarrier() {
     Document holder = currHolder();
     BiFunction<ClientSession, MongoCollection<Document>, TxnResponse> command =
         (session, coll) -> {
           var filter = eq("_id", getKey());
-          Document barrier = coll.find(session, filter).first();
+          Document barrier;
 
-          if (barrier == null) return TxnResponse.thrownAnError("Barrier not exists.");
+          // 返回成功，但是不阻塞当前线程
+          if ((barrier = coll.find(session, filter).first()) == null) return ok();
 
           long revision = barrier.getLong("v"), newRevision = revision + 1;
-          filter = and(filter, eq("v", revision));
-          var update = Updates.combine(addToSet("o", holder), inc("v", newRevision));
+          var newFilter = and(filter, eq("v", revision));
+          var update = combine(addToSet("o", holder), inc("v", newRevision));
 
-          // 如果barrier为空，则代表当前barrier不存在数据库(Not matched any)
-          barrier = coll.findOneAndUpdate(session, filter, update, UPDATE_OPTIONS);
-          if (barrier == null) return TxnResponse.thrownAnError("Barrier not exists.");
-          var txnOk =
-              barrier.getList("o", Document.class) != null
-                  && barrier.getList("o", Document.class).contains(holder);
-          return txnOk ? TxnResponse.ok() : TxnResponse.retryableError();
+          // 如果barrier为空，需要重试继续更新
+          if ((barrier = coll.findOneAndUpdate(session, newFilter, update, UPDATE_OPTIONS)) == null)
+            return retryableError();
+          return barrier.getList("o", Document.class) != null
+                  && barrier.getList("o", Document.class).contains(holder)
+              ? parkThreadWithSuccess()
+              : retryableError();
         };
-
-    TxnResponse txnResponse =
-        commandExecutor.loopExecute(
-            command,
-            commandExecutor.defaultDBErrorHandlePolicy(
-                LockBusy, LockFailed, LockTimeout, WriteConflict, NoSuchTransaction),
-            null,
-            t -> !t.txnOk && t.retryable && !t.thrownError);
-
-    if (txnResponse.thrownError) throw new SignalException(txnResponse.message);
-    lock.lock();
-    try {
-      removed.await();
-    } finally {
-      lock.unlock();
-    }
+    return commandExecutor.loopExecute(
+        command,
+        commandExecutor.defaultDBErrorHandlePolicy(
+            LockBusy, LockFailed, LockTimeout, WriteConflict, NoSuchTransaction),
+        null,
+        t -> !t.txnOk && t.retryable && !t.thrownError);
   }
 
   @Override
@@ -165,14 +167,14 @@ public final class DistributeBarrierImp extends DistributeMongoSignalBase
     BiFunction<ClientSession, MongoCollection<Document>, TxnResponse> command =
         (session, coll) -> {
           var filter = eq("_id", getKey());
-          Document barrier = coll.find(session, filter).first();
 
-          if (barrier == null) return TxnResponse.thrownAnError("Barrier not exists.");
-
-          filter = and(filter, eq("v", barrier.getLong("v")));
-          DeleteResult deleteResult = coll.deleteOne(session, filter);
+          // 如果要移除的Barrier不存在，则不向上抛出错误
+          Document barrier;
+          if ((barrier = coll.find(session, filter).first()) == null) return ok();
+          var newFilter = and(filter, eq("v", barrier.getLong("v")));
+          DeleteResult deleteResult = coll.deleteOne(session, newFilter);
           var success = deleteResult.getDeletedCount() == 1L;
-          return success ? TxnResponse.ok() : TxnResponse.retryableError();
+          return success ? ok() : retryableError();
         };
 
     TxnResponse txnResponse =

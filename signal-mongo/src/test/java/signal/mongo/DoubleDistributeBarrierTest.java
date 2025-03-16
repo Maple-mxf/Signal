@@ -1,17 +1,14 @@
 package signal.mongo;
 
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import org.junit.Test;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import signal.api.DistributeDoubleBarrier;
 import signal.api.Lease;
-
-import java.util.List;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.CopyOnWriteArrayList;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.TimeUnit;
 
 public class DoubleDistributeBarrierTest extends BaseResourceSetup {
 
@@ -34,13 +31,10 @@ public class DoubleDistributeBarrierTest extends BaseResourceSetup {
     Lease lease = signalClient.grantLease(null);
     DistributeDoubleBarrier doubleBarrier = lease.getDoubleBarrier("Test-Double-Barrier", 4);
 
-    List<Thread> threads = new CopyOnWriteArrayList<>();
-
     for (int i = 0; i < 4; i++) {
       CompletableFuture.runAsync(
           () -> {
             try {
-              threads.add(Thread.currentThread());
               doubleBarrier.enter();
               LOGGER.info("DoubleBarrie enter done");
 
@@ -53,15 +47,8 @@ public class DoubleDistributeBarrierTest extends BaseResourceSetup {
           },
           executorService);
     }
-    TimeUnit.SECONDS.sleep(124L);
-    for (Thread thread : threads) {
-      System.err.println(thread.getState());
-    }
 
-    //lease.revoke();
-  }
-
-  public static void main(String[] args){
-    System.err.println(3&2);
+    TimeUnit.SECONDS.sleep(4L);
+    lease.revoke();
   }
 }

@@ -32,8 +32,8 @@ import com.google.common.collect.ImmutableList;
 import com.google.common.eventbus.EventBus;
 import com.google.common.eventbus.Subscribe;
 import com.google.errorprone.annotations.CheckReturnValue;
-import com.google.errorprone.annotations.CompileTimeConstant;
 import com.google.errorprone.annotations.DoNotCall;
+import com.google.errorprone.annotations.Keep;
 import com.google.errorprone.annotations.ThreadSafe;
 import com.google.errorprone.annotations.concurrent.GuardedBy;
 import com.mongodb.client.ClientSession;
@@ -130,6 +130,7 @@ public final class DistributeReadWriteLockImp extends DistributeMongoSignalBase
    *       C操作唤醒挂起的线程，整个过程即使存在脏读的情况，但是依然会保证结果的正确性
    * </ul>
    */
+  @Keep
   @GuardedBy("varHandle")
   @VisibleForTesting
   final StateVars<String> stateVars;
@@ -191,7 +192,7 @@ public final class DistributeReadWriteLockImp extends DistributeMongoSignalBase
       implements DistributeWriteLock {
 
     public DistributeWriteLockImp(
-        Lease lease, @CompileTimeConstant String key, MongoClient mongoClient, MongoDatabase db) {
+        Lease lease, String key, MongoClient mongoClient, MongoDatabase db) {
       super(lease, key, mongoClient, db, READ_WRITE_LOCK_NAMED);
     }
 
@@ -365,8 +366,7 @@ public final class DistributeReadWriteLockImp extends DistributeMongoSignalBase
   @AutoService(DistributeReadLock.class)
   class DistributeReadLockImp extends DistributeMongoSignalBase implements DistributeReadLock {
 
-    DistributeReadLockImp(
-        Lease lease, @CompileTimeConstant String key, MongoClient mongoClient, MongoDatabase db) {
+    DistributeReadLockImp(Lease lease, String key, MongoClient mongoClient, MongoDatabase db) {
       super(lease, key, mongoClient, db, READ_WRITE_LOCK_NAMED);
     }
 

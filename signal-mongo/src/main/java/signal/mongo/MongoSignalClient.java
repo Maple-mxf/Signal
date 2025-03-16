@@ -39,7 +39,6 @@ import com.google.auto.service.AutoService;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.ImmutableMap;
 import com.google.errorprone.annotations.Keep;
-import com.google.errorprone.annotations.MustBeClosed;
 import com.google.errorprone.annotations.ThreadSafe;
 import com.mongodb.MongoNamespace;
 import com.mongodb.bulk.BulkWriteResult;
@@ -132,7 +131,7 @@ public class MongoSignalClient implements SignalClient {
 
   private final MongoClient mongoClient;
 
-  @MustBeClosed
+  @SuppressWarnings("FutureReturnValueIgnored")
   private MongoSignalClient(MongoClient mongoClient, String dbNamed) {
     this.mongoClient = mongoClient;
     this.db = mongoClient.getDatabase(dbNamed);
@@ -152,6 +151,8 @@ public class MongoSignalClient implements SignalClient {
   private static MongoSignalClient INSTANCE;
 
   /**
+   * Get Single Instance
+   *
    * @param client client
    * @param dbNamed dbNamed
    * @return MongoSignalClient instance

@@ -16,9 +16,9 @@ final class TxnResponse {
     this.parkThread = parkThread;
   }
 
-  public static TxnResponse OK = new TxnResponse(true, false, false, false, "");
-  public static TxnResponse RETRYABLE_ERROR = new TxnResponse(false, false, false, false, "");
-  public static TxnResponse PARK_THREAD = new TxnResponse(false, true, true, false, "");
+  public static final TxnResponse OK = new TxnResponse(true, false, false, false, "");
+  public static final TxnResponse RETRYABLE_ERROR = new TxnResponse(false, true, false, false, "");
+  public static final TxnResponse PARK_THREAD = new TxnResponse(false, true, true, false, "");
 
   public static TxnResponse ok() {
     return OK;
@@ -36,14 +36,24 @@ final class TxnResponse {
     return PARK_THREAD;
   }
 
+  public static TxnResponse parkThreadWithSuccess() {
+    return new TxnResponse(true, true, true, false, "");
+  }
+
   @Override
   public String toString() {
-    return "TxnResponse{" +
-            "txnOk=" + txnOk +
-            ", retryable=" + retryable +
-            ", thrownError=" + thrownError +
-            ", message='" + message + '\'' +
-            ", parkThread=" + parkThread +
-            '}';
+    return "TxnResponse{"
+        + "txnOk="
+        + txnOk
+        + ", retryable="
+        + retryable
+        + ", thrownError="
+        + thrownError
+        + ", message='"
+        + message
+        + '\''
+        + ", parkThread="
+        + parkThread
+        + '}';
   }
 }

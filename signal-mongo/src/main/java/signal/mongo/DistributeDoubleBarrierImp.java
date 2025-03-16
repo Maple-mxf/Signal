@@ -23,6 +23,7 @@ import static signal.mongo.TxnResponse.thrownAnError;
 import com.google.auto.service.AutoService;
 import com.google.common.eventbus.EventBus;
 import com.google.common.eventbus.Subscribe;
+import com.google.errorprone.annotations.DoNotCall;
 import com.google.errorprone.annotations.ThreadSafe;
 import com.mongodb.Function;
 import com.mongodb.client.ClientSession;
@@ -100,25 +101,40 @@ final class DistributeDoubleBarrierImp extends DistributeMongoSignalBase
   @Override
   public void enter() throws InterruptedException {
     checkState();
+    TxnResponse txnResponse = this.doEnter();
+    if (txnResponse.thrownError) {
+      if (lock.isLocked() && lock.isHeldByCurrentThread()) lock.unlock();
+      throw new SignalException(txnResponse.message);
+    }
+    try {
+      entered.await();
+    } finally {
+      lock.unlock();
+    }
+  }
+
+  private TxnResponse doEnter() {
     Document holder = getCurrHolder(1);
     BiFunction<ClientSession, MongoCollection<Document>, TxnResponse> command =
         (session, coll) -> {
-          Document doubleBarrier =
-              coll.findOneAndUpdate(
-                  session,
-                  eq("_id", this.getKey()),
-                  combine(
-                      setOnInsert("p", this.participants()), addToSet("o", holder), inc("v", 1L)),
-                  UPSERT_OPTIONS);
-          if (doubleBarrier == null) {
-            return retryableError();
-          }
+          Document doubleBarrier;
+          if ((doubleBarrier =
+                  coll.findOneAndUpdate(
+                      session,
+                      eq("_id", this.getKey()),
+                      combine(
+                          setOnInsert("p", this.participants()),
+                          addToSet("o", holder),
+                          inc("v", 1L)),
+                      UPSERT_OPTIONS))
+              == null) return retryableError();
+
           int p = doubleBarrier.getInteger("p");
           if (p != this.participants)
             return thrownAnError(
                 String.format(
                     """
-                                                            The current number of participants is %d, which is not equal to the set number of %d.
+                    The current number of participants is %d, which is not equal to the set number of %d.
                     """,
                     this.participants, p));
 
@@ -133,26 +149,15 @@ final class DistributeDoubleBarrierImp extends DistributeMongoSignalBase
           if (optional.get().getInteger("state") != 1)
             return thrownAnError("The current phase is leaved.");
           // 提交事务之前，为避免awakeAll函数先执行，在TXN事务内部加锁，扩大锁覆盖的临界区
-          lock.lock();
+          // lock.lock();
           return ok();
         };
-
-    TxnResponse txnResponse =
-        commandExecutor.loopExecute(
-            command,
-            commandExecutor.defaultDBErrorHandlePolicy(
-                LockTimeout, LockBusy, LockFailed, NoSuchTransaction, WriteConflict, DuplicateKey),
-            null,
-            t -> !t.txnOk && t.retryable && !t.thrownError);
-    if (txnResponse.thrownError) {
-      if (lock.isLocked() && lock.isHeldByCurrentThread()) lock.unlock();
-      throw new SignalException(txnResponse.message);
-    }
-    try {
-      entered.await();
-    } finally {
-      lock.unlock();
-    }
+    return commandExecutor.loopExecute(
+        command,
+        commandExecutor.defaultDBErrorHandlePolicy(
+            LockTimeout, LockBusy, LockFailed, NoSuchTransaction, WriteConflict, DuplicateKey),
+        null,
+        t -> !t.txnOk && t.retryable && !t.thrownError);
   }
 
   @Override
@@ -234,6 +239,7 @@ final class DistributeDoubleBarrierImp extends DistributeMongoSignalBase
    *
    * @param event double barrier的更新操作，不监听删除事件
    */
+  @DoNotCall
   @Subscribe
   void awakeAll(ChangeStreamEvents.DoubleBarrierChangeEvent event) {
     if (!this.getKey().equals(event.doubleBarrierKey())

@@ -32,6 +32,7 @@ import com.google.common.collect.ImmutableList;
 import com.google.common.eventbus.EventBus;
 import com.google.common.eventbus.Subscribe;
 import com.google.errorprone.annotations.DoNotCall;
+import com.google.errorprone.annotations.Keep;
 import com.google.errorprone.annotations.ThreadSafe;
 import com.google.errorprone.annotations.concurrent.GuardedBy;
 import com.mongodb.client.ClientSession;
@@ -116,6 +117,7 @@ public class DistributeSemaphoreImp extends DistributeMongoSignalBase
   // 确保写操作的顺序性：防止某些写操作被重新排序到屏障之前
   // 确保读操作的顺序性：防止某些读操作被重新排序到屏障之后。
   // 保证线程间的内存可见性：确保在某个线程中进行的写操作对其他线程是可见的。
+  @Keep
   @GuardedBy("varHandle")
   @VisibleForTesting
   StateVars<Integer> stateVars;

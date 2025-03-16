@@ -44,4 +44,5 @@ tasks.javadoc {
 
 tasks.withType<JavaCompile>().configureEach {
     options.errorprone.disableWarningsInGeneratedCode.set(true)
+    //options.errorprone.disableAllChecks=true
 }
