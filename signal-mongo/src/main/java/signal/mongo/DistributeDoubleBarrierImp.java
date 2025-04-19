@@ -17,6 +17,7 @@ import static signal.mongo.MongoErrorCode.LockTimeout;
 import static signal.mongo.MongoErrorCode.NoSuchTransaction;
 import static signal.mongo.MongoErrorCode.WriteConflict;
 import static signal.mongo.TxnResponse.ok;
+import static signal.mongo.TxnResponse.parkThreadWithSuccess;
 import static signal.mongo.TxnResponse.retryableError;
 import static signal.mongo.TxnResponse.thrownAnError;
 
@@ -32,6 +33,7 @@ import com.mongodb.client.MongoCollection;
 import com.mongodb.client.MongoDatabase;
 import com.mongodb.client.model.changestream.ChangeStreamDocument;
 import com.mongodb.client.result.DeleteResult;
+import com.mongodb.client.result.InsertOneResult;
 import java.util.Collection;
 import java.util.List;
 import java.util.Optional;
@@ -64,6 +66,8 @@ import signal.api.SignalException;
  * }
  * }</pre>
  */
+
+// TODO 需要重写内部逻辑
 @ThreadSafe
 @AutoService(DistributeDoubleBarrier.class)
 final class DistributeDoubleBarrierImp extends DistributeMongoSignalBase
@@ -102,14 +106,15 @@ final class DistributeDoubleBarrierImp extends DistributeMongoSignalBase
   public void enter() throws InterruptedException {
     checkState();
     TxnResponse txnResponse = this.doEnter();
-    if (txnResponse.thrownError) {
-      if (lock.isLocked() && lock.isHeldByCurrentThread()) lock.unlock();
-      throw new SignalException(txnResponse.message);
-    }
-    try {
-      entered.await();
-    } finally {
-      lock.unlock();
+    if (txnResponse.thrownError) throw new SignalException(txnResponse.message);
+
+    if (txnResponse.parkThread) {
+      lock.lock();
+      try {
+        entered.await();
+      } finally {
+        lock.unlock();
+      }
     }
   }
 
@@ -118,6 +123,21 @@ final class DistributeDoubleBarrierImp extends DistributeMongoSignalBase
     BiFunction<ClientSession, MongoCollection<Document>, TxnResponse> command =
         (session, coll) -> {
           Document doubleBarrier;
+
+          if ((doubleBarrier = coll.find(session, eq("_id", this.getKey())).first()) == null) {
+            InsertOneResult insertOneResult =
+                coll.insertOne(
+                    new Document("_id", getKey())
+                        .append("p", participants())
+                        .append("o", List.of(holder))
+                        .append("v", 1L));
+            return insertOneResult.getInsertedId() != null
+                ? parkThreadWithSuccess()
+                : retryableError();
+          }
+
+
+
           if ((doubleBarrier =
                   coll.findOneAndUpdate(
                       session,
@@ -148,9 +168,7 @@ final class DistributeDoubleBarrierImp extends DistributeMongoSignalBase
 
           if (optional.get().getInteger("state") != 1)
             return thrownAnError("The current phase is leaved.");
-          // 提交事务之前，为避免awakeAll函数先执行，在TXN事务内部加锁，扩大锁覆盖的临界区
-          // lock.lock();
-          return ok();
+          return parkThreadWithSuccess();
         };
     return commandExecutor.loopExecute(
         command,
@@ -197,9 +215,6 @@ final class DistributeDoubleBarrierImp extends DistributeMongoSignalBase
             }
             return retryableError();
           }
-          // 提交事务之前，为避免awakeAll函数先执行，在TXN事务内部加锁，扩大锁覆盖的临界区
-          // 由于锁的可重入性质，Lambda外部代码可以重复Lock
-          lock.lock();
           return ok();
         };
     TxnResponse txnResponse =
@@ -210,14 +225,14 @@ final class DistributeDoubleBarrierImp extends DistributeMongoSignalBase
             null,
             t -> !t.txnOk && t.retryable && !t.thrownError);
 
-    if (txnResponse.thrownError) {
-      if (lock.isLocked() && lock.isHeldByCurrentThread()) lock.unlock();
-      throw new SignalException(txnResponse.message);
-    }
-    try {
-      leaved.await();
-    } finally {
-      lock.unlock();
+    if (txnResponse.thrownError) throw new SignalException(txnResponse.message);
+    if (txnResponse.parkThread) {
+      lock.lock();
+      try {
+        leaved.await();
+      } finally {
+        lock.unlock();
+      }
     }
   }
 

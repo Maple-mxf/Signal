@@ -9,6 +9,7 @@ import java.util.concurrent.locks.ReentrantLock;
 
 public class ReentrantDistributeLockTest {
 
+  @SuppressWarnings("FutureReturnValueIgnored")
   @Test
   public void testConditions() throws InterruptedException {
     ReentrantLock lock = new ReentrantLock();
