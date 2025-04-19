@@ -146,7 +146,7 @@ final class DistributeDoubleBarrierImp extends DistributeMongoSignalBase
                           setOnInsert("p", this.participants()),
                           addToSet("o", holder),
                           inc("v", 1L)),
-                      UPSERT_OPTIONS))
+                          FU_UPSERT_OPTIONS))
               == null) return retryableError();
 
           int p = doubleBarrier.getInteger("p");
@@ -195,7 +195,7 @@ final class DistributeDoubleBarrierImp extends DistributeMongoSignalBase
                           eq("thread", holder.get("thread")),
                           eq("lease", holder.get("lease")))));
           var update = combine(set("o.$.state", 0), inc("v", 1L));
-          Document doubleBarrier = coll.findOneAndUpdate(session, filter, update, UPDATE_OPTIONS);
+          Document doubleBarrier = coll.findOneAndUpdate(session, filter, update, FU_UPDATE_OPTIONS);
           Optional<Document> optional;
           if (doubleBarrier == null || (optional = extractHolder(doubleBarrier, holder)).isEmpty())
             return thrownAnError(

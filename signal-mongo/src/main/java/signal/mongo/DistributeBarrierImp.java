@@ -146,7 +146,7 @@ public final class DistributeBarrierImp extends DistributeMongoSignalBase
           var update = combine(addToSet("o", holder), inc("v", newRevision));
 
           // 如果barrier为空，需要重试继续更新
-          if ((barrier = coll.findOneAndUpdate(session, newFilter, update, UPDATE_OPTIONS)) == null)
+          if ((barrier = coll.findOneAndUpdate(session, newFilter, update, FU_UPDATE_OPTIONS)) == null)
             return retryableError();
           return barrier.getList("o", Document.class) != null
                   && barrier.getList("o", Document.class).contains(holder)

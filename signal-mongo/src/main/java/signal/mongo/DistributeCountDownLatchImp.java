@@ -2,6 +2,9 @@ package signal.mongo;
 
 import static com.mongodb.client.model.Filters.and;
 import static com.mongodb.client.model.Filters.eq;
+import static com.mongodb.client.model.Updates.addToSet;
+import static com.mongodb.client.model.Updates.combine;
+import static com.mongodb.client.model.Updates.inc;
 import static java.util.concurrent.TimeUnit.NANOSECONDS;
 import static signal.mongo.CollectionNamed.COUNT_DOWN_LATCH_NAMED;
 import static signal.mongo.MongoErrorCode.LockFailed;
@@ -60,7 +63,7 @@ final class DistributeCountDownLatchImp extends DistributeMongoSignalBase
   @Keep
   @GuardedBy("varHandle")
   @VisibleForTesting
-  StateVars<Boolean> stateVars;
+  StateVars<Integer> stateVars;
 
   // Acquire 语义
   // 1. 保证当前线程在交换操作后，能够“获得”并看到所有其他线程在交换之前已经做出的更新。
@@ -86,7 +89,9 @@ final class DistributeCountDownLatchImp extends DistributeMongoSignalBase
 
     this.eventBus = eventBus;
     this.eventBus.register(this);
-    this.stateVars = new StateVars<>(false);
+
+    // -1 代表Init状态
+    this.stateVars = new StateVars<>(-1);
     try {
       this.varHandle =
           MethodHandles.lookup()
@@ -144,9 +149,15 @@ final class DistributeCountDownLatchImp extends DistributeMongoSignalBase
           // 到达删除条件
           if (cc + 1 == this.count) {
             DeleteResult deleteResult = coll.deleteOne(session, filter);
+            return deleteResult.getDeletedCount() == 1L ? ok() : retryableError();
           }
-
-          return extractHolder(cdl, holder).isPresent() ? ok() : retryableError();
+          var updates = combine(inc("cc", 1), inc("v", 1), addToSet("o", holder));
+          return ((cdl = collection.findOneAndUpdate(session, filter, updates, FU_UPDATE_OPTIONS))
+                      != null
+                  && extractHolder(cdl, holder).isPresent()
+                  && cdl.getLong("v") == newRevision)
+              ? ok()
+              : retryableError();
         };
     TxnResponse rsp =
         commandExecutor.loopExecute(

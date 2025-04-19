@@ -235,7 +235,7 @@ public class DistributeSemaphoreImp extends DistributeMongoSignalBase
                               inc("v", 1)))
                   .orElseGet(() -> combine(addToSet("o", holder), inc("v", 1L)));
 
-          return ((sem = collection.findOneAndUpdate(session, filter, updates, UPDATE_OPTIONS))
+          return ((sem = collection.findOneAndUpdate(session, filter, updates, FU_UPDATE_OPTIONS))
                       != null
                   && extractHolder(sem, holder).isPresent()
                   && sem.getLong("v") == newRevision)
@@ -347,7 +347,7 @@ public class DistributeSemaphoreImp extends DistributeMongoSignalBase
               unreleased > 0
                   ? combine(inc("v", 1), set("o.$.acquire_permits", unreleased))
                   : combine(inc("v", 1), pull("o", eq("lease", holder.get("lease"))));
-          return ((sem = collection.findOneAndUpdate(session, filter, update, UPDATE_OPTIONS))
+          return ((sem = collection.findOneAndUpdate(session, filter, update, FU_UPDATE_OPTIONS))
                       != null
                   && sem.getLong("v") == newRevision)
               ? ok()

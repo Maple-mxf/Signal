@@ -160,7 +160,7 @@ public final class DistributeMutexLockImp extends DistributeMongoSignalBase
           } else {
             update = combine(inc("v", 1L), inc("o.$.state", 1L));
           }
-          return ((mutex = coll.findOneAndUpdate(session, filter, update, UPDATE_OPTIONS)) != null
+          return ((mutex = coll.findOneAndUpdate(session, filter, update, FU_UPDATE_OPTIONS)) != null
                   && mutex.getLong("v") == newRevision
                   && extractHolder(mutex, holder).isPresent())
               ? ok()
@@ -230,7 +230,7 @@ public final class DistributeMutexLockImp extends DistributeMongoSignalBase
           }
 
           var update = combine(inc("v", 1L), inc("o.$.state", -1L));
-          return ((mutex = coll.findOneAndUpdate(session, filter, update, UPDATE_OPTIONS)) != null
+          return ((mutex = coll.findOneAndUpdate(session, filter, update, FU_UPDATE_OPTIONS)) != null
                   && mutex.getLong("v") == newRevision
                   && (optional = extractHolder(mutex, holder)).isPresent()
                   && optional.get().getLong("state") == newState)

@@ -17,6 +17,7 @@ import com.mongodb.client.MongoCollection;
 import com.mongodb.client.MongoDatabase;
 import com.mongodb.client.model.FindOneAndUpdateOptions;
 import com.mongodb.client.model.ReturnDocument;
+import com.mongodb.client.model.UpdateOptions;
 import java.util.Collection;
 import java.util.List;
 import java.util.Optional;
@@ -49,11 +50,13 @@ abstract class DistributeMongoSignalBase extends DistributeSignalBase {
                 Holder.self(this.getLease().getLeaseID()));
     }
 
-    static final FindOneAndUpdateOptions UPSERT_OPTIONS =
+    static final FindOneAndUpdateOptions FU_UPSERT_OPTIONS =
             new FindOneAndUpdateOptions().upsert(true).returnDocument(ReturnDocument.AFTER);
 
-    static final FindOneAndUpdateOptions UPDATE_OPTIONS =
+    static final FindOneAndUpdateOptions FU_UPDATE_OPTIONS =
             new FindOneAndUpdateOptions().upsert(false).returnDocument(ReturnDocument.AFTER);
+    
+    static final UpdateOptions UPDATE_OPTIONS = new UpdateOptions().upsert(false);
 
     /**
      * Command Executor
