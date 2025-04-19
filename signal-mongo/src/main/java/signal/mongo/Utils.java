@@ -30,7 +30,8 @@ final class Utils {
     return and(
         eq("hostname", holder.get("hostname")),
         eq("thread", holder.get("thread")),
-        eq("lease", holder.get("lease")));
+        eq("lease", holder.get("lease"))
+    );
   }
 
   /**

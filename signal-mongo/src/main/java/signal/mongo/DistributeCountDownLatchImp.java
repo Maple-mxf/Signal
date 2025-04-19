@@ -1,11 +1,7 @@
 package signal.mongo;
 
-import static com.google.common.base.Preconditions.checkArgument;
+import static com.mongodb.client.model.Filters.and;
 import static com.mongodb.client.model.Filters.eq;
-import static com.mongodb.client.model.Updates.addToSet;
-import static com.mongodb.client.model.Updates.combine;
-import static com.mongodb.client.model.Updates.inc;
-import static com.mongodb.client.model.Updates.setOnInsert;
 import static java.util.concurrent.TimeUnit.NANOSECONDS;
 import static signal.mongo.CollectionNamed.COUNT_DOWN_LATCH_NAMED;
 import static signal.mongo.MongoErrorCode.LockFailed;
@@ -17,15 +13,25 @@ import static signal.mongo.TxnResponse.thrownAnError;
 import static signal.mongo.Utils.unparkSuccessor;
 
 import com.google.auto.service.AutoService;
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.collect.ImmutableList;
 import com.google.common.eventbus.EventBus;
 import com.google.common.eventbus.Subscribe;
 import com.google.errorprone.annotations.DoNotCall;
+import com.google.errorprone.annotations.Keep;
 import com.google.errorprone.annotations.ThreadSafe;
+import com.google.errorprone.annotations.concurrent.GuardedBy;
 import com.mongodb.client.ClientSession;
 import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoCollection;
 import com.mongodb.client.MongoDatabase;
+import com.mongodb.client.result.DeleteResult;
+import com.mongodb.client.result.InsertOneResult;
+import java.lang.invoke.MethodHandles;
+import java.lang.invoke.VarHandle;
 import java.util.Collection;
+import java.util.List;
+import java.util.Optional;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
@@ -46,6 +52,24 @@ final class DistributeCountDownLatchImp extends DistributeMongoSignalBase
   private final ReentrantLock lock;
   private final Condition countDone;
 
+  // 建立内存屏障
+  // 确保写操作的顺序性：防止某些写操作被重新排序到屏障之前
+  // 确保读操作的顺序性：防止某些读操作被重新排序到屏障之后。
+  // 保证线程间的内存可见性：确保在某个线程中进行的写操作对其他线程是可见的。
+  // Value代表是否完成
+  @Keep
+  @GuardedBy("varHandle")
+  @VisibleForTesting
+  StateVars<Boolean> stateVars;
+
+  // Acquire 语义
+  // 1. 保证当前线程在交换操作后，能够“获得”并看到所有其他线程在交换之前已经做出的更新。
+  // 2. 确保当前线程执行该交换操作之后，后续的读取操作能够看到正确的共享数据状态。
+  // Release 语义
+  // 1. 保证当前线程在交换操作之前，对共享变量的所有写操作（即交换操作之前的写操作）都已经完成，并且这些写操作对其他线程是可见的。
+  // 2. 确保当前线程执行该交换操作之前，所有对共享数据的写操作已经对其他线程“发布”，使得其他线程能够正确看到这些更新。
+  private final VarHandle varHandle;
+
   DistributeCountDownLatchImp(
       Lease lease,
       String key,
@@ -54,19 +78,37 @@ final class DistributeCountDownLatchImp extends DistributeMongoSignalBase
       int count,
       EventBus eventBus) {
     super(lease, key, mongoClient, db, COUNT_DOWN_LATCH_NAMED);
+    if (count <= 0)
+      throw new IllegalArgumentException("The value of count must be greater than 0.");
     this.count = count;
-    checkArgument(count > 0, "The value of count must be greater than 0.");
-
     this.lock = new ReentrantLock();
     this.countDone = lock.newCondition();
 
     this.eventBus = eventBus;
     this.eventBus.register(this);
+    this.stateVars = new StateVars<>(false);
+    try {
+      this.varHandle =
+          MethodHandles.lookup()
+              .findVarHandle(DistributeCountDownLatchImp.class, "stateVars", StateVars.class);
+    } catch (NoSuchFieldException | IllegalAccessException e) {
+      throw new IllegalStateException();
+    }
   }
 
   @Override
   public int count() {
     return count;
+  }
+
+  Document currHolder() {
+    return new Document("lease", this.getLease().getLeaseID());
+  }
+
+  Optional<Document> extractHolder(Document signal, Document holder) {
+    List<Document> holders = signal.getList("o", Document.class);
+    if (holders == null || holders.isEmpty()) return Optional.empty();
+    return holders.stream().filter(t -> t.get("lease").equals(holder.get("lease"))).findFirst();
   }
 
   @Override
@@ -75,19 +117,36 @@ final class DistributeCountDownLatchImp extends DistributeMongoSignalBase
 
     BiFunction<ClientSession, MongoCollection<Document>, TxnResponse> command =
         (session, coll) -> {
-          Document countDownLatch =
-              coll.findOneAndUpdate(
-                  session,
-                  eq("_id", this.getKey()),
-                  combine(addToSet("o", holder), setOnInsert("c", this.count), inc("cc", 1)),
-                  UPSERT_OPTIONS);
-          if (countDownLatch == null) return retryableError();
-          if (countDownLatch.getInteger("c") != this.count)
+          Document cdl = coll.find(session, eq("_id", this.getKey())).first();
+          if (cdl == null) {
+            InsertOneResult insertOneResult =
+                coll.insertOne(
+                    new Document("_id", this.getKey())
+                        .append("c", this.count)
+                        .append("cc", 1)
+                        .append(
+                            "o",
+                            ImmutableList.of(new Document("lease", this.getLease().getLeaseID())))
+                        .append("v", 1L));
+            return (insertOneResult.getInsertedId() != null && insertOneResult.wasAcknowledged())
+                ? ok()
+                : retryableError();
+          }
+          int cc = cdl.getInteger("cc");
+          if (cdl.getInteger("c") != this.count)
             return thrownAnError(
                 "Count down error. Because another process is using count down latch resources");
-          int cc = countDownLatch.getInteger("cc");
           if (cc > this.count) return thrownAnError("Count down exceed.");
-          return extractHolder(countDownLatch, holder).isPresent() ? ok() : retryableError();
+
+          long revision = cdl.getLong("v"), newRevision = revision + 1;
+          var filter = and(eq("_id", this.getKey()), eq("v", revision));
+
+          // 到达删除条件
+          if (cc + 1 == this.count) {
+            DeleteResult deleteResult = coll.deleteOne(session, filter);
+          }
+
+          return extractHolder(cdl, holder).isPresent() ? ok() : retryableError();
         };
     TxnResponse rsp =
         commandExecutor.loopExecute(
@@ -117,10 +176,10 @@ final class DistributeCountDownLatchImp extends DistributeMongoSignalBase
             return thrownAnError(
                 String.format(
                     """
-                                                                          The signal registration information of CountDownLatch is inconsistent with the information of the current instance.
-                                                                          current count = %d,
-                                                                          instance of registered count = %d
-                                                                          """,
+                    The signal registration information of CountDownLatch is inconsistent with the information of the current instance.
+                    current count = %d,
+                    instance of registered count = %d
+                    """,
                     this.count, c));
           }
 

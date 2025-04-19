@@ -30,88 +30,91 @@ import signal.api.Lease;
 
 abstract class DistributeMongoSignalBase extends DistributeSignalBase {
 
-  @Keep
-  private static final Logger LOGGER = LoggerFactory.getLogger(DistributeMongoSignalBase.class);
+    @Keep
+    private static final Logger LOGGER = LoggerFactory.getLogger(DistributeMongoSignalBase.class);
 
-  final MongoClient mongoClient;
-  final MongoCollection<Document> collection;
+    final MongoClient mongoClient;
+    final MongoCollection<Document> collection;
 
-  static final TransactionOptions TRANSACTION_OPTIONS =
-      TransactionOptions.builder()
-          .readPreference(ReadPreference.primary())
-          .readConcern(ReadConcern.MAJORITY)
-          .writeConcern(WriteConcern.MAJORITY)
-          .build();
+    static final TransactionOptions TRANSACTION_OPTIONS =
+            TransactionOptions.builder()
+                    .readPreference(ReadPreference.primary())
+                    .readConcern(ReadConcern.MAJORITY)
+                    .writeConcern(WriteConcern.MAJORITY)
+                    .build();
 
-  Document currHolder() {
-    return Utils.mappedHolder2Bson(
-        this.getLease().getLeaseID(), Holder.self(this.getLease().getLeaseID()));
-  }
+    Document currHolder() {
+        return Utils.mappedHolder2Bson(
+                this.getLease().getLeaseID(),
+                Holder.self(this.getLease().getLeaseID()));
+    }
 
-  static final FindOneAndUpdateOptions UPSERT_OPTIONS =
-      new FindOneAndUpdateOptions().upsert(true).returnDocument(ReturnDocument.AFTER);
+    static final FindOneAndUpdateOptions UPSERT_OPTIONS =
+            new FindOneAndUpdateOptions().upsert(true).returnDocument(ReturnDocument.AFTER);
 
-  static final FindOneAndUpdateOptions UPDATE_OPTIONS =
-      new FindOneAndUpdateOptions().upsert(false).returnDocument(ReturnDocument.AFTER);
+    static final FindOneAndUpdateOptions UPDATE_OPTIONS =
+            new FindOneAndUpdateOptions().upsert(false).returnDocument(ReturnDocument.AFTER);
 
-  /** Command Executor */
-  protected final CommandExecutor commandExecutor;
+    /**
+     * Command Executor
+     */
+    protected final CommandExecutor commandExecutor;
 
-  public DistributeMongoSignalBase(
-      Lease lease,
-      String key,
-      MongoClient mongoClient,
-      MongoDatabase db,
-      String collectionName) {
-    super(lease, key);
-    this.closed = false;
-    this.mongoClient = mongoClient;
-    this.collection = db.getCollection(collectionName);
-    this.commandExecutor = new CommandExecutor(this, mongoClient, collection);
-  }
+    public DistributeMongoSignalBase(
+            Lease lease,
+            String key,
+            MongoClient mongoClient,
+            MongoDatabase db,
+            String collectionName) {
+        super(lease, key);
+        this.closed = false;
+        this.mongoClient = mongoClient;
+        this.collection = db.getCollection(collectionName);
+        this.commandExecutor = new CommandExecutor(this, mongoClient, collection);
+    }
 
-  protected void checkState() {
-    Preconditions.checkArgument(!getLease().isRevoked(), "Lease revoked.");
-    Preconditions.checkState(!closed, "Semaphore instance closed.");
-  }
+    protected void checkState() {
+        Preconditions.checkArgument(!getLease().isRevoked(), "Lease revoked.");
+        Preconditions.checkState(!closed, "Semaphore instance closed.");
+    }
 
-  static Optional<Document> extractHolder(Document signal, Document holder) {
-    List<Document> holders = signal.getList("o", Document.class);
-    if (holders == null || holders.isEmpty()) return Optional.empty();
-    return holders.stream()
-        .filter(
-            t ->
-                t.get("lease").equals(holder.get("lease"))
-                    && t.get("thread").equals(holder.get("thread"))
-                    && t.get("hostname").equals(holder.get("hostname")))
-        .findFirst();
-  }
+    Optional<Document> extractHolder(Document signal, Document holder) {
+        List<Document> holders = signal.getList("o", Document.class);
+        if (holders == null || holders.isEmpty()) return Optional.empty();
+        return holders.stream()
+                .filter(
+                        t ->
+                                t.get("lease").equals(holder.get("lease"))
+                                        && t.get("thread").equals(holder.get("thread"))
+                                        && t.get("hostname").equals(holder.get("hostname")))
+                .findFirst();
+    }
 
-  protected Collection<Holder> doGetHolders() {
-    BiFunction<ClientSession, MongoCollection<Document>, Collection<Holder>> command =
-        (session, coll) -> {
-          Document signal = coll.find(session, eq("_id", this.getKey())).first();
-          if (signal == null) return emptyList();
+    protected Collection<Holder> doGetHolders() {
+        BiFunction<ClientSession, MongoCollection<Document>, Collection<Holder>> command =
+                (session, coll) -> {
+                    Document signal = coll.find(session, eq("_id", this.getKey())).first();
+                    if (signal == null) return emptyList();
 
-          List<Document> holders = signal.getList("o", Document.class);
-          if (holders == null || holders.isEmpty()) return emptyList();
-          return Lists.transform(holders, Utils::mappedDoc2Holder);
-        };
-    return commandExecutor.loopExecute(
-        command, commandExecutor.defaultDBErrorHandlePolicy(NoSuchTransaction), null, t -> false);
-  }
+                    List<Document> holders = signal.getList("o", Document.class);
+                    if (holders == null || holders.isEmpty()) return emptyList();
+                    return Lists.transform(holders, Utils::mappedDoc2Holder);
+                };
+        return commandExecutor.loopExecute(
+                command, commandExecutor.defaultDBErrorHandlePolicy(NoSuchTransaction), null, t -> false);
+    }
 
-  protected Holder doGetFirstHolder() {
-    return doGetHolders().stream().findFirst().orElse(null);
-  }
+    protected Holder doGetFirstHolder() {
+        return doGetHolders().stream().findFirst().orElse(null);
+    }
 
-  protected boolean doIsHeldCurrentThread() {
-    Document holder = currHolder();
-    return doGetHolders().stream()
-        .anyMatch(
-            t ->
-                t.thread() == holder.getLong("thread")
-                    && t.hostname().equals(holder.getString("hostname"))
-                    && t.leaseId().equals(holder.getString("lease")));
-  }
+    protected boolean doIsHeldCurrentThread() {
+        Document holder = currHolder();
+        return doGetHolders().stream()
+                .anyMatch(
+                        t ->
+                                t.thread() == holder.getLong("thread")
+                                        && t.hostname().equals(holder.getString("hostname"))
+                                        && t.leaseId().equals(holder.getString("lease")));
+    }
 }

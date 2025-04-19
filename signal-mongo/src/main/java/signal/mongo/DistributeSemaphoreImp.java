@@ -23,7 +23,6 @@ import static signal.mongo.TxnResponse.ok;
 import static signal.mongo.TxnResponse.parkThread;
 import static signal.mongo.TxnResponse.retryableError;
 import static signal.mongo.TxnResponse.thrownAnError;
-import static signal.mongo.Utils.mappedHolder2AndFilter;
 import static signal.mongo.Utils.parkCurrentThreadUntil;
 
 import com.google.auto.service.AutoService;
@@ -90,8 +89,6 @@ import signal.api.SignalException;
  *     p: 4,
  *     o: [
  *       {
- *         hostname: '79b33a',
- *         thread: Long('33'),
  *         lease: '26122259844800000',
  *         acquire_permits: 1
  *       },
@@ -101,7 +98,7 @@ import signal.api.SignalException;
  * ]}
  *     </pre>
  *
- * 信号的公平性：公平
+ * <p>信号的公平性：公平
  */
 @ThreadSafe
 @AutoService({DistributeSemaphore.class})
@@ -143,12 +140,22 @@ public class DistributeSemaphoreImp extends DistributeMongoSignalBase
     this.permits = permits;
     this.stateVars = new StateVars<>(0);
     try {
-      varHandle =
+      this.varHandle =
           MethodHandles.lookup()
               .findVarHandle(DistributeSemaphoreImp.class, "stateVars", StateVars.class);
     } catch (NoSuchFieldException | IllegalAccessException e) {
       throw new IllegalStateException();
     }
+  }
+
+  Document currHolder() {
+    return new Document("lease", this.getLease().getLeaseID());
+  }
+
+  Optional<Document> extractHolder(Document signal, Document holder) {
+    List<Document> holders = signal.getList("o", Document.class);
+    if (holders == null || holders.isEmpty()) return Optional.empty();
+    return holders.stream().filter(t -> t.get("lease").equals(holder.get("lease"))).findFirst();
   }
 
   @Override
@@ -193,6 +200,7 @@ public class DistributeSemaphoreImp extends DistributeMongoSignalBase
             if (identityHashCode(
                     varHandle.compareAndExchangeRelease(this, currState, new StateVars<>(occupied)))
                 == currStateAddr) {
+              // TODO 返回parkThread没有意义
               return parkThread();
             }
             return retryableError();
@@ -214,7 +222,7 @@ public class DistributeSemaphoreImp extends DistributeMongoSignalBase
                   ? and(
                       eq("_id", this.getKey()),
                       eq("v", revision),
-                      elemMatch("o", mappedHolder2AndFilter(holder)))
+                      elemMatch("o", eq("lease", holder.get("lease"))))
                   : and(eq("_id", this.getKey()), eq("v", revision));
           var updates =
               optional
@@ -248,7 +256,7 @@ public class DistributeSemaphoreImp extends DistributeMongoSignalBase
               // 可用的许可数量 = 总许可数量 - 已占用的许可数量
               () ->
                   permits
-                      > (this.permits() - ((StateVars<Integer>) varHandle.getAcquire(this)).value),
+                      >= (this.permits() - ((StateVars<Integer>) varHandle.getAcquire(this)).value),
               timed,
               s,
               (waitTimeNanos - (nanoTime() - s)));
@@ -338,7 +346,7 @@ public class DistributeSemaphoreImp extends DistributeMongoSignalBase
           var update =
               unreleased > 0
                   ? combine(inc("v", 1), set("o.$.acquire_permits", unreleased))
-                  : combine(inc("v", 1), pull("o", mappedHolder2AndFilter(holder)));
+                  : combine(inc("v", 1), pull("o", eq("lease", holder.get("lease"))));
           return ((sem = collection.findOneAndUpdate(session, filter, update, UPDATE_OPTIONS))
                       != null
                   && sem.getLong("v") == newRevision)
