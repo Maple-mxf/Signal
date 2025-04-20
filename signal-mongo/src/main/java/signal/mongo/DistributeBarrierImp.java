@@ -55,13 +55,9 @@ import signal.api.SignalException;
  *   v: Long('7'),
  *   o: [
  *     {
- *       hostname: 'D0C058',
- *       thread: Long('24'),
  *       lease: '29052205361338000'
  *     },
  *     {
- *       hostname: 'D0C058',
- *       thread: Long('25'),
  *       lease: '29052205361338000'
  *     }
  *   ]
@@ -72,13 +68,6 @@ import signal.api.SignalException;
 @AutoService(DistributeBarrier.class)
 public final class DistributeBarrierImp extends DistributeMongoSignalBase
     implements DistributeBarrier {
-
-  enum BarrierState {
-    NONE,
-    SET,
-    WAIT,
-    RELEASE
-  }
 
   private final ReentrantLock lock;
   private final Condition removed;

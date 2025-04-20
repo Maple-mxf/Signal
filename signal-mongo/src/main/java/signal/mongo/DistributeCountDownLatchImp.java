@@ -50,8 +50,19 @@ import signal.api.Lease;
 import signal.api.SignalException;
 
 /**
- * {@code [ { _id: 'test-count-down-latch', c: 8, cc: 0, o: [ { lease: '20083130490189898' } ], v:
- * Long('1') } ] }
+ * 数据存储格式
+ *
+ * <pre>{@code
+ * [
+ *    {
+ *         _id: 'test-count-down-latch',
+ *         c: 8,
+ *         cc: 0,
+ *         o: [ { lease: '20091433915734183' } ],
+ *         v: Long('1')
+ *     }
+ * ]
+ * }</pre>
  */
 @ThreadSafe
 @AutoService(DistributeCountDownLatch.class)
