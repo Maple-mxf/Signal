@@ -200,8 +200,7 @@ public class DistributeSemaphoreImp extends DistributeMongoSignalBase
             if (identityHashCode(
                     varHandle.compareAndExchangeRelease(this, currState, new StateVars<>(occupied)))
                 == currStateAddr) {
-              // TODO 返回parkThread没有意义
-              return parkThread();
+              return parkThread(); // TODO 返回parkThread没有意义
             }
             return retryableError();
           }
@@ -264,7 +263,7 @@ public class DistributeSemaphoreImp extends DistributeMongoSignalBase
 
       checkState();
 
-      TxnResponse outbound =
+      TxnResponse rsp =
           commandExecutor.loopExecute(
               command,
               commandExecutor.defaultDBErrorHandlePolicy(
@@ -275,13 +274,13 @@ public class DistributeSemaphoreImp extends DistributeMongoSignalBase
               timed ? (waitTimeNanos - (nanoTime() - s)) : -1L,
               NANOSECONDS);
 
-      if (outbound.txnOk) {
+      if (rsp.txnOk) {
         doUnparkSuccessor();
         return;
       }
 
       // Unexpected error
-      if (outbound.thrownError) throw new SignalException(outbound.message);
+      if (rsp.thrownError) throw new SignalException(rsp.message);
 
       // Timeout
       if (timed && (nanoTime() - s) >= waitTimeNanos) throw new SignalException("Timeout.");
@@ -302,9 +301,7 @@ public class DistributeSemaphoreImp extends DistributeMongoSignalBase
       //       下一个阻塞的线程继续获取permits
       //   B-B 若第一个阻塞的线程申请permits失败并且满足阻塞条件，则进入阻塞状态，awakeHead函数将唤醒
       //       第一个阻塞的线程
-      if (outbound.parkThread) {
-        Thread.onSpinWait();
-      }
+      if (rsp.parkThread) Thread.onSpinWait();
     }
   }
 
@@ -425,7 +422,7 @@ public class DistributeSemaphoreImp extends DistributeMongoSignalBase
    */
   @DoNotCall
   @Subscribe
-  final void awakeHead(ChangeStreamEvents.SemaphoreChangeAndRemovedEvent event) {
+  final void awakeSuccessor(ChangeStreamEvents.SemaphoreChangeAndRemovedEvent event) {
     if (!this.getKey().equals(event.semaphoreKey()) || this.permits() != event.permits()) return;
 
     Next:

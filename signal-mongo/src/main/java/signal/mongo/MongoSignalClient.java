@@ -270,16 +270,19 @@ public class MongoSignalClient implements SignalClient {
       // 监听countdownlatch的修改事件
       new ChangeEventsHandler(
           COUNT_DOWN_LATCH_NAMED,
-          UPDATE_OP,
+          UPDATE_OP | INSERT_OP | DELETE_OP,
           streamDocument -> {
-            String countDownLatchKey = getKeyFn.apply(streamDocument);
+            String cdlKey = getKeyFn.apply(streamDocument);
             eventHandlerFn.accept(
                 streamDocument,
                 t ->
                     new ChangeStreamEvents.CountDownLatchChangeEvent(
-                        countDownLatchKey,
-                        t.getFullDocument().getInteger("c"),
-                        t.getFullDocument().getInteger("cc")));
+                        cdlKey,
+                        t.getFullDocument() == null
+                            ? t.getFullDocumentBeforeChange().getInteger("c")
+                            : t.getFullDocument().getInteger("c"),
+                        t.getFullDocument() == null ? 0 : t.getFullDocument().getInteger("cc"),
+                        t.getFullDocument()));
           }),
 
       // 监听semaphore的修改和删除事件

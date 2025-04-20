@@ -15,7 +15,12 @@ interface ChangeStreamEvents {
       Document fullDocument)
       implements ChangeStreamEvents {}
 
-  record CountDownLatchChangeEvent(String countDownLatchKey, int c, int cc)
+  record CountDownLatchChangeEvent(
+      String cdlKey,
+      int c,
+      int cc,
+      // 当对应删除操作时，fullDocument为空
+      Document fullDocument)
       implements ChangeStreamEvents {}
 
   record SemaphoreChangeAndRemovedEvent(

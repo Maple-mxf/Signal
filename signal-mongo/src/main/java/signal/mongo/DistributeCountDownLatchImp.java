@@ -5,6 +5,9 @@ import static com.mongodb.client.model.Filters.eq;
 import static com.mongodb.client.model.Updates.addToSet;
 import static com.mongodb.client.model.Updates.combine;
 import static com.mongodb.client.model.Updates.inc;
+import static com.mongodb.client.model.Updates.setOnInsert;
+import static java.lang.System.identityHashCode;
+import static java.lang.System.nanoTime;
 import static java.util.concurrent.TimeUnit.NANOSECONDS;
 import static signal.mongo.CollectionNamed.COUNT_DOWN_LATCH_NAMED;
 import static signal.mongo.MongoErrorCode.LockFailed;
@@ -13,6 +16,7 @@ import static signal.mongo.MongoErrorCode.WriteConflict;
 import static signal.mongo.TxnResponse.ok;
 import static signal.mongo.TxnResponse.retryableError;
 import static signal.mongo.TxnResponse.thrownAnError;
+import static signal.mongo.Utils.parkCurrentThreadUntil;
 import static signal.mongo.Utils.unparkSuccessor;
 
 import com.google.auto.service.AutoService;
@@ -45,6 +49,10 @@ import signal.api.Holder;
 import signal.api.Lease;
 import signal.api.SignalException;
 
+/**
+ * {@code [ { _id: 'test-count-down-latch', c: 8, cc: 0, o: [ { lease: '20083130490189898' } ], v:
+ * Long('1') } ] }
+ */
 @ThreadSafe
 @AutoService(DistributeCountDownLatch.class)
 final class DistributeCountDownLatchImp extends DistributeMongoSignalBase
@@ -90,14 +98,45 @@ final class DistributeCountDownLatchImp extends DistributeMongoSignalBase
     this.eventBus = eventBus;
     this.eventBus.register(this);
 
-    // -1 代表Init状态
-    this.stateVars = new StateVars<>(-1);
     try {
       this.varHandle =
           MethodHandles.lookup()
               .findVarHandle(DistributeCountDownLatchImp.class, "stateVars", StateVars.class);
     } catch (NoSuchFieldException | IllegalAccessException e) {
       throw new IllegalStateException();
+    }
+
+    Document h = currHolder();
+    BiFunction<ClientSession, MongoCollection<Document>, TxnResponse> command =
+        (session, coll) -> {
+          Document cdl =
+              coll.findOneAndUpdate(
+                  session,
+                  eq("_id", this.getKey()),
+                  combine(
+                      setOnInsert("c", this.count),
+                      setOnInsert("cc", 0),
+                      setOnInsert("v", 1L),
+                      addToSet("o", h)),
+                  FU_UPSERT_OPTIONS);
+          if (cdl == null) return retryableError();
+          if (cdl.getInteger("c") != this.count)
+            return thrownAnError(
+                "Count down error. Because another process is using count down latch resources");
+          this.stateVars = new StateVars<>(cdl.getInteger("cc"));
+          return ok();
+        };
+
+    for (; ; ) {
+      TxnResponse rsp =
+          commandExecutor.loopExecute(
+              command,
+              commandExecutor.defaultDBErrorHandlePolicy(
+                  LockFailed, NoSuchTransaction, WriteConflict),
+              null,
+              t -> !t.txnOk && t.retryable && !t.thrownError);
+      if (rsp.txnOk) return;
+      if (rsp.thrownError) throw new SignalException(rsp.message);
     }
   }
 
@@ -178,46 +217,20 @@ final class DistributeCountDownLatchImp extends DistributeMongoSignalBase
 
   @Override
   public void await(long waitTime, TimeUnit timeUnit) throws InterruptedException {
-    BiFunction<ClientSession, MongoCollection<Document>, TxnResponse> command =
-        (session, coll) -> {
-          Document countDownLatch = coll.find(session, eq("_id", this.getKey())).first();
-          if (countDownLatch == null) return thrownAnError("CountDownLatch instance not exists.");
-          int c = countDownLatch.getInteger("c");
-          if (c != this.count) {
-            return thrownAnError(
-                String.format(
-                    """
-                    The signal registration information of CountDownLatch is inconsistent with the information of the current instance.
-                    current count = %d,
-                    instance of registered count = %d
-                    """,
-                    this.count, c));
-          }
-
-          return ok();
-        };
-    TxnResponse rsp =
-        commandExecutor.loopExecute(
-            command,
-            commandExecutor.defaultDBErrorHandlePolicy(LockFailed, NoSuchTransaction),
-            null,
-            t -> !t.txnOk && t.retryable && !t.thrownError);
-    if (rsp.thrownError) {
-      if (lock.isLocked() && lock.isHeldByCurrentThread()) lock.unlock();
-      throw new SignalException(rsp.message);
-    }
-
-    lock.lock();
-    try {
-      boolean timed = waitTime > 0L;
-      if (timed) {
-        if (!countDone.await(waitTime, timeUnit)) throw new SignalException("Timeout.");
-      } else {
-        countDone.await();
-      }
-    } finally {
-      lock.unlock();
-    }
+    long s = nanoTime(), waitTimeNanos = timeUnit.toNanos(waitTime);
+    boolean timed = waitTime > 0;
+    boolean elapsed =
+        parkCurrentThreadUntil(
+            lock,
+            countDone,
+            () -> {
+              int v = ((StateVars<Integer>) varHandle.getAcquire(this)).value;
+              return v < this.count;
+            },
+            timed,
+            s,
+            (waitTimeNanos - (nanoTime() - s)));
+    if (!elapsed) throw new SignalException("Timeout.");
   }
 
   @Override
@@ -228,11 +241,34 @@ final class DistributeCountDownLatchImp extends DistributeMongoSignalBase
 
   @DoNotCall
   @Subscribe
-  void awakeAll(ChangeStreamEvents.CountDownLatchChangeEvent event) {
-    if (!this.getKey().equals(event.countDownLatchKey())) return;
-    if (this.count != event.c()) return;
-    if (event.cc() != this.count()) return;
-    unparkSuccessor(lock, countDone, true);
+  void awakeAllSuccessor(ChangeStreamEvents.CountDownLatchChangeEvent event) {
+    if (!this.getKey().equals(event.cdlKey()) || this.count != event.c()) return;
+
+    Next:
+    for (; ; ) {
+      StateVars<Integer> currState = (StateVars<Integer>) varHandle.getAcquire(this);
+      int currStateAddr = identityHashCode(currState);
+
+      // 代表删除操作
+      if (event.fullDocument() == null) {
+        if (identityHashCode(
+                varHandle.compareAndExchangeRelease(this, currState, new StateVars<>(this.count)))
+            == currStateAddr) {
+          unparkSuccessor(lock, countDone, true);
+          return;
+        }
+        Thread.onSpinWait();
+        continue Next;
+      }
+      int cc = event.cc();
+      if (identityHashCode(
+              varHandle.compareAndExchangeRelease(this, currState, new StateVars<>(cc)))
+          == currStateAddr) {
+        return;
+      }
+      Thread.onSpinWait();
+      continue Next;
+    }
   }
 
   @Override

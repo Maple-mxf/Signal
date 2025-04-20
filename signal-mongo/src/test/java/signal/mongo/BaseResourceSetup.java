@@ -22,7 +22,7 @@ public class BaseResourceSetup {
 
   @Before
   public void setup() {
-    this.mongoClient = MongoClients.create("mongodb://127.0.0.1:27017");
+    this.mongoClient = MongoClients.create("mongodb://127.0.0.1:5707");
     this.signalClient = MongoSignalClient.getInstance(mongoClient, dbNamed);
     doSetup();
   }
