@@ -105,7 +105,7 @@ public final class DistributeReadWriteLockImp extends DistributeMongoSignalBase
    *
    * <ul>
    *   <li>来自MongoDB ChangeStream的事件通知，此方法本身不会并发{@link
-   *       DistributeReadWriteLockImp#awakeHead(ChangeStreamEvents.ReadWriteLockChangeAndRemovedEvent)}
+   *       DistributeReadWriteLockImp#awakeSuccessor(ChangeStreamEvents.ReadWriteLockChangeAndRemovedEvent)}
    *   <li>{@link DistributeWriteLockImp#lock()}
    *   <li>{@link DistributeReadLockImp#lock()}
    * </ul>
@@ -116,7 +116,7 @@ public final class DistributeReadWriteLockImp extends DistributeMongoSignalBase
    *   <li>A操作: Java线程1 执行了{@link DistributeReadLockImp#unlock()}操作
    *   <li>B操作: Java线程2 执行了{@link DistributeWriteLockImp#lock()}操作
    *   <li>C操作: Java线程3 执行了{@link
-   *       DistributeReadWriteLockImp#awakeHead(ChangeStreamEvents.ReadWriteLockChangeAndRemovedEvent)}
+   *       DistributeReadWriteLockImp#awakeSuccessor(ChangeStreamEvents.ReadWriteLockChangeAndRemovedEvent)}
    * </ul>
    *
    * <p>A操作先执行释放锁资源，假设 B操作和C操作同时进入并发临界区，B操作和C操作都会更新 state 的值，只能有一个操作可以更新state的值成功， 因为存在{@link
@@ -125,7 +125,7 @@ public final class DistributeReadWriteLockImp extends DistributeMongoSignalBase
    * <ul>
    *   <li>C操作对应的线程更新state成功， C操作将state的值更新为 "" 空字符串，表示当前锁资源可用，B操作更新state失败，会在事务内部返回{@link
    *       TxnResponse#retryableError()}，C操作进行重试，读到当前锁资源可用，整个过程不存在脏读或者{@link
-   *       DistributeReadWriteLockImp#awakeHead(ChangeStreamEvents.ReadWriteLockChangeAndRemovedEvent)}函数错过没有挂起的线程
+   *       DistributeReadWriteLockImp#awakeSuccessor(ChangeStreamEvents.ReadWriteLockChangeAndRemovedEvent)}函数错过没有挂起的线程
    *   <li>B操作对应的线程更新state成功，假设此时B操作读到了脏数据（A操作提交之前的数据版本）， B操作将state的值更新为 "r"，表示当前锁资源不可用，B操作挂起线程，
    *       C操作唤醒挂起的线程，整个过程即使存在脏读的情况，但是依然会保证结果的正确性
    * </ul>
@@ -617,7 +617,7 @@ public final class DistributeReadWriteLockImp extends DistributeMongoSignalBase
    */
   @DoNotCall
   @Subscribe
-  void awakeHead(ChangeStreamEvents.ReadWriteLockChangeAndRemovedEvent event) {
+  void awakeSuccessor(ChangeStreamEvents.ReadWriteLockChangeAndRemovedEvent event) {
     Document fullDocument = event.fullDocument();
 
     List<Document> holders =

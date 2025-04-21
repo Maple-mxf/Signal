@@ -31,7 +31,7 @@ public class DistributeBarrierTest extends BaseResourceSetup {
             try {
               LOGGER.debug(
                   "Prepare waiton the barrier ThreadId = {}", Thread.currentThread().getId());
-              barrier.waitOnBarrier();
+              barrier.await();
               LOGGER.debug("Leave the barrier ThreadId = {}", Thread.currentThread().getId());
             } catch (Throwable e) {
               e.printStackTrace();

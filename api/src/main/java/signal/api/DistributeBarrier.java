@@ -39,6 +39,7 @@ import com.google.errorprone.annotations.ThreadSafe;
 public interface DistributeBarrier extends DistributeSignal, Shared {
 
   /** 设置障碍点 */
+  @Deprecated
   void setBarrier();
 
   /**
@@ -46,7 +47,7 @@ public interface DistributeBarrier extends DistributeSignal, Shared {
    *
    * @throws InterruptedException 主线程deadline，wait状态的线程会抛出此错误
    */
-  void waitOnBarrier() throws InterruptedException;
+  void await() throws InterruptedException;
 
   /** 移除障碍 */
   void removeBarrier();

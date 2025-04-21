@@ -160,7 +160,8 @@ public final class DistributeMutexLockImp extends DistributeMongoSignalBase
           } else {
             update = combine(inc("v", 1L), inc("o.$.state", 1L));
           }
-          return ((mutex = coll.findOneAndUpdate(session, filter, update, FU_UPDATE_OPTIONS)) != null
+          return ((mutex = coll.findOneAndUpdate(session, filter, update, FU_UPDATE_OPTIONS))
+                      != null
                   && mutex.getLong("v") == newRevision
                   && extractHolder(mutex, holder).isPresent())
               ? ok()
@@ -194,11 +195,8 @@ public final class DistributeMutexLockImp extends DistributeMongoSignalBase
               timed,
               timed ? (waitTimeNanos - (nanoTime() - s)) : -1L,
               NANOSECONDS);
-      if (rsp.txnOk) {
-        return true;
-      }
+      if (rsp.txnOk) return true;
       if (rsp.thrownError) throw new SignalException(rsp.message);
-
       if (rsp.parkThread) Thread.onSpinWait();
     }
   }
@@ -230,7 +228,8 @@ public final class DistributeMutexLockImp extends DistributeMongoSignalBase
           }
 
           var update = combine(inc("v", 1L), inc("o.$.state", -1L));
-          return ((mutex = coll.findOneAndUpdate(session, filter, update, FU_UPDATE_OPTIONS)) != null
+          return ((mutex = coll.findOneAndUpdate(session, filter, update, FU_UPDATE_OPTIONS))
+                      != null
                   && mutex.getLong("v") == newRevision
                   && (optional = extractHolder(mutex, holder)).isPresent()
                   && optional.get().getLong("state") == newState)

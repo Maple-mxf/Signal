@@ -103,7 +103,7 @@ public final class DistributeBarrierImp extends DistributeMongoSignalBase
   }
 
   @Override
-  public void waitOnBarrier() throws InterruptedException {
+  public void await() throws InterruptedException {
     checkState();
     TxnResponse txnResponse;
     while ((txnResponse = this.doWaitOnBarrier()).txnOk

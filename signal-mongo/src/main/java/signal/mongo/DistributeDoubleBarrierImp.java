@@ -256,7 +256,7 @@ final class DistributeDoubleBarrierImp extends DistributeMongoSignalBase
    */
   @DoNotCall
   @Subscribe
-  void awakeAll(ChangeStreamEvents.DoubleBarrierChangeEvent event) {
+  void awakeAllSuccessor(ChangeStreamEvents.DoubleBarrierChangeEvent event) {
     if (!this.getKey().equals(event.doubleBarrierKey())
         || event.participants() != this.participants()) return;
 
