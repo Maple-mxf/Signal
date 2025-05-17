@@ -182,7 +182,7 @@ final class DistributeDoubleBarrierImp extends DistributeMongoSignalBase
                           eq("lease", holder.get("lease")))));
           var update = combine(set("o.$.state", 0), inc("v", 1L));
           Document doubleBarrier =
-              coll.findOneAndUpdate(session, filter, update, FU_UPDATE_OPTIONS);
+              coll.findOneAndUpdate(session, filter, update, UPDATE_OPTIONS);
           Optional<Document> optional;
           if (doubleBarrier == null || (optional = extractHolder(doubleBarrier, holder)).isEmpty())
             return thrownAnError(

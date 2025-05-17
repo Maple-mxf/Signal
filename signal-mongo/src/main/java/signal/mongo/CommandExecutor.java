@@ -15,7 +15,6 @@ import java.util.concurrent.TimeUnit;
 import java.util.function.BiFunction;
 import java.util.function.Function;
 import java.util.function.Predicate;
-import org.bson.Document;
 import signal.api.SignalException;
 
 /**
@@ -36,17 +35,17 @@ import signal.api.SignalException;
  * href="https://www.mongodb.com/docs/manual/core/transactions-in-applications/#std-label-transactionTooLargeForCache-error">
  * TransactionTooLargeForCache</a>
  */
-final class CommandExecutor {
+final class CommandExecutor<Doc> {
   private final MongoClient mongoClient;
-  private final MongoCollection<Document> collection;
-  private final DistributeMongoSignalBase signal;
+  private final MongoCollection<Doc> collection;
+  private final DistributeMongoSignalBase<Doc> signal;
 
   public static final String TRANSACTION_TOO_LARGE_ERROR_LABEL = "TransactionTooLargeForCache";
 
   CommandExecutor(
-      DistributeMongoSignalBase signal,
+      DistributeMongoSignalBase<Doc> signal,
       MongoClient mongoClient,
-      MongoCollection<Document> collection) {
+      MongoCollection<Doc> collection) {
     this.mongoClient = mongoClient;
     this.collection = collection;
     this.signal = signal;
@@ -64,7 +63,7 @@ final class CommandExecutor {
 
   @CheckReturnValue
   <T> T loopExecute(
-      @NonNull BiFunction<ClientSession, MongoCollection<Document>, T> command,
+      @NonNull BiFunction<ClientSession, MongoCollection<Doc>, T> command,
       @Nullable
           BiFunction<MongoException, MongoErrorCode, CommandResponse<T>> dbErrorHandlePolicy) {
     return loopExecute(command, dbErrorHandlePolicy, null, t -> false);
@@ -72,7 +71,7 @@ final class CommandExecutor {
 
   @CheckReturnValue
   <T> T loopExecute(
-      @NonNull BiFunction<ClientSession, MongoCollection<Document>, T> command,
+      @NonNull BiFunction<ClientSession, MongoCollection<Doc>, T> command,
       @Nullable BiFunction<MongoException, MongoErrorCode, CommandResponse<T>> dbErrorHandlePolicy,
       @Nullable Function<Throwable, CommandResponse<T>> unexpectedErrorHandlePolicy,
       Predicate<T> resultHandlePolicy) {
@@ -88,7 +87,7 @@ final class CommandExecutor {
 
   @CheckReturnValue
   <T> T loopExecute(
-      @NonNull BiFunction<ClientSession, MongoCollection<Document>, T> command,
+      @NonNull BiFunction<ClientSession, MongoCollection<Doc>, T> command,
       @Nullable BiFunction<MongoException, MongoErrorCode, CommandResponse<T>> dbErrorHandlePolicy,
       @Nullable Function<Throwable, CommandResponse<T>> unexpectedErrorHandlePolicy,
       Predicate<T> resultHandlePolicy,
@@ -140,7 +139,7 @@ final class CommandExecutor {
 
   @CheckReturnValue
   <T> CommandResponse<T> execute(
-      @NonNull BiFunction<ClientSession, MongoCollection<Document>, T> command,
+      @NonNull BiFunction<ClientSession, MongoCollection<Doc>, T> command,
       @Nullable BiFunction<MongoException, MongoErrorCode, CommandResponse<T>> dbErrorHandlePolicy,
       @Nullable Function<Throwable, CommandResponse<T>> unexpectedErrorHandlePolicy) {
 

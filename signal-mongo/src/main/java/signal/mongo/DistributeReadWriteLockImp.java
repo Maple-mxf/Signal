@@ -242,7 +242,7 @@ public final class DistributeReadWriteLockImp extends DistributeMongoSignalBase
                     ? combine(set("m", WRITE_MODE), inc("v", 1L), addToSet("o", holder))
                     : combine(inc("v", 1L), addToSet("o", holder));
             // 如果为空代表无法匹配到对应的锁资源，需要继续重试
-            return ((writeLock = coll.findOneAndUpdate(session, filter, update, FU_UPDATE_OPTIONS))
+            return ((writeLock = coll.findOneAndUpdate(session, filter, update, UPDATE_OPTIONS))
                         != null
                     && writeLock.getLong("v") == newRevision
                     && extractHolder(writeLock, holder).isPresent())
@@ -424,7 +424,7 @@ public final class DistributeReadWriteLockImp extends DistributeMongoSignalBase
                     combine(addToSet("o", holder), set("m", WRITE_MODE), inc("v", 1L))
                     // 有线程占用锁，但是锁的模式是读锁模式
                     : combine(addToSet("o", holder), inc("v", 1L));
-            readLock = coll.findOneAndUpdate(session, filter, update, FU_UPDATE_OPTIONS);
+            readLock = coll.findOneAndUpdate(session, filter, update, UPDATE_OPTIONS);
             return (readLock != null
                     && newRevision == readLock.getLong("v")
                     && extractHolder(readLock, holder).isPresent())
@@ -517,7 +517,7 @@ public final class DistributeReadWriteLockImp extends DistributeMongoSignalBase
                             eq("host", holder.get("host")),
                             eq("thread", holder.get("thread")))),
                     inc("v", 1L));
-            readLock = coll.findOneAndUpdate(session, filter, update, FU_UPDATE_OPTIONS);
+            readLock = coll.findOneAndUpdate(session, filter, update, UPDATE_OPTIONS);
             return (readLock != null
                     && readLock.getLong("v") == newRevision
                     && extractHolder(readLock, holder).isEmpty())
@@ -588,7 +588,7 @@ public final class DistributeReadWriteLockImp extends DistributeMongoSignalBase
 
           // 将所有的Holder删除
           var update = pull("o", new Document("lease", this.getLease().getLeaseID()));
-          return ((lock = coll.findOneAndUpdate(session, filter, update, FU_UPDATE_OPTIONS)) != null
+          return ((lock = coll.findOneAndUpdate(session, filter, update, UPDATE_OPTIONS)) != null
                   && lock.getLong("v") == newRevision
                   && ((holders = lock.getList("o", Document.class)) == null
                       || holders.isEmpty()

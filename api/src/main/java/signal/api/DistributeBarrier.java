@@ -38,10 +38,6 @@ import com.google.errorprone.annotations.ThreadSafe;
 @ThreadSafe
 public interface DistributeBarrier extends DistributeSignal, Shared {
 
-  /** 设置障碍点 */
-  @Deprecated
-  void setBarrier();
-
   /**
    * 等待障碍移除
    *
@@ -55,5 +51,5 @@ public interface DistributeBarrier extends DistributeSignal, Shared {
   /**
    * @return 返回当前到达障碍处的线程数量
    */
-  int getHoldCount();
+  int getWaiterCount();
 }

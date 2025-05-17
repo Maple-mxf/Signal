@@ -23,7 +23,7 @@ public class DistributeBarrierTest extends BaseResourceSetup {
   public void testSmokeFunc() throws InterruptedException {
     Lease lease = signalClient.grantLease(null);
     DistributeBarrier barrier = lease.getBarrier("Test-Barrier");
-    barrier.setBarrier();
+//    barrier.setBarrier();
     int concurrency = 2;
     for (int i = 0; i < concurrency; i++) {
       CompletableFuture.runAsync(
@@ -39,7 +39,7 @@ public class DistributeBarrierTest extends BaseResourceSetup {
           },
           executorService);
     }
-    while (concurrency != barrier.getHoldCount()) {
+    while (concurrency != barrier.getWaiterCount()) {
       Thread.onSpinWait();
     }
     TimeUnit.SECONDS.sleep(3L);

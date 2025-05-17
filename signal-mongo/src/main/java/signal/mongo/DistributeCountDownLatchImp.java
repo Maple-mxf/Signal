@@ -100,8 +100,7 @@ final class DistributeCountDownLatchImp extends DistributeMongoSignalBase
       int count,
       EventBus eventBus) {
     super(lease, key, mongoClient, db, COUNT_DOWN_LATCH_NAMED);
-    if (count <= 0)
-      throw new IllegalArgumentException("The value of count must be greater than 0.");
+    if (count <= 0) throw new IllegalArgumentException();
     this.count = count;
     this.lock = new ReentrantLock();
     this.countDone = lock.newCondition();
@@ -129,7 +128,7 @@ final class DistributeCountDownLatchImp extends DistributeMongoSignalBase
                       setOnInsert("cc", 0),
                       setOnInsert("v", 1L),
                       addToSet("o", h)),
-                  FU_UPSERT_OPTIONS);
+                      UPSERT_OPTIONS);
           if (cdl == null) return retryableError();
           if (cdl.getInteger("c") != this.count)
             return thrownAnError(
@@ -202,7 +201,7 @@ final class DistributeCountDownLatchImp extends DistributeMongoSignalBase
             return deleteResult.getDeletedCount() == 1L ? ok() : retryableError();
           }
           var updates = combine(inc("cc", 1), inc("v", 1), addToSet("o", holder));
-          return ((cdl = collection.findOneAndUpdate(session, filter, updates, FU_UPDATE_OPTIONS))
+          return ((cdl = collection.findOneAndUpdate(session, filter, updates, UPDATE_OPTIONS))
                       != null
                   && extractHolder(cdl, holder).isPresent()
                   && cdl.getLong("v") == newRevision)

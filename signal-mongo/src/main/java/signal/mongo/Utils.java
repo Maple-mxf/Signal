@@ -5,6 +5,7 @@ import static com.mongodb.client.model.Filters.eq;
 import static java.lang.System.nanoTime;
 import static java.util.concurrent.TimeUnit.NANOSECONDS;
 
+import java.util.Optional;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Supplier;
@@ -30,8 +31,7 @@ final class Utils {
     return and(
         eq("hostname", holder.get("hostname")),
         eq("thread", holder.get("thread")),
-        eq("lease", holder.get("lease"))
-    );
+        eq("lease", holder.get("lease")));
   }
 
   /**
@@ -80,5 +80,13 @@ final class Utils {
 
   static boolean isBitSet(int num, int n) {
     return (num & (1 << n)) != 0;
+  }
+
+  static String getCurrentThreadName() {
+    return String.format("%s-%d", Thread.currentThread().getName(), Thread.currentThread().getId());
+  }
+
+  static String getCurrentHostname() {
+    return Optional.ofNullable(System.getenv("HOSTNAME")).orElse("");
   }
 }
