@@ -82,7 +82,7 @@ final class DistributeCountDownLatchImp extends DistributeMongoSignalBase
   @Keep
   @GuardedBy("varHandle")
   @VisibleForTesting
-  StateVars<Integer> stateVars;
+  StatefulVar<Integer> stateVars;
 
   // Acquire 语义
   // 1. 保证当前线程在交换操作后，能够“获得”并看到所有其他线程在交换之前已经做出的更新。
@@ -112,7 +112,7 @@ final class DistributeCountDownLatchImp extends DistributeMongoSignalBase
     try {
       this.varHandle =
           MethodHandles.lookup()
-              .findVarHandle(DistributeCountDownLatchImp.class, "stateVars", StateVars.class);
+              .findVarHandle(DistributeCountDownLatchImp.class, "stateVars", StatefulVar.class);
     } catch (NoSuchFieldException | IllegalAccessException e) {
       throw new IllegalStateException();
     }
@@ -134,7 +134,7 @@ final class DistributeCountDownLatchImp extends DistributeMongoSignalBase
           if (cdl.getInteger("c") != this.count)
             return thrownAnError(
                 "Count down error. Because another process is using count down latch resources");
-          this.stateVars = new StateVars<>(cdl.getInteger("cc"));
+          this.stateVars = new StatefulVar<>(cdl.getInteger("cc"));
           return ok();
         };
 
@@ -235,7 +235,7 @@ final class DistributeCountDownLatchImp extends DistributeMongoSignalBase
             lock,
             countDone,
             () -> {
-              int v = ((StateVars<Integer>) varHandle.getAcquire(this)).value;
+              int v = ((StatefulVar<Integer>) varHandle.getAcquire(this)).value;
               return v < this.count;
             },
             timed,
@@ -257,13 +257,13 @@ final class DistributeCountDownLatchImp extends DistributeMongoSignalBase
 
     Next:
     for (; ; ) {
-      StateVars<Integer> currState = (StateVars<Integer>) varHandle.getAcquire(this);
+      StatefulVar<Integer> currState = (StatefulVar<Integer>) varHandle.getAcquire(this);
       int currStateAddr = identityHashCode(currState);
 
       // 代表删除操作
       if (event.fullDocument() == null) {
         if (identityHashCode(
-                varHandle.compareAndExchangeRelease(this, currState, new StateVars<>(this.count)))
+                varHandle.compareAndExchangeRelease(this, currState, new StatefulVar<>(this.count)))
             == currStateAddr) {
           unparkSuccessor(lock, countDone, true);
           return;
@@ -273,7 +273,7 @@ final class DistributeCountDownLatchImp extends DistributeMongoSignalBase
       }
       int cc = event.cc();
       if (identityHashCode(
-              varHandle.compareAndExchangeRelease(this, currState, new StateVars<>(cc)))
+              varHandle.compareAndExchangeRelease(this, currState, new StatefulVar<>(cc)))
           == currStateAddr) {
         return;
       }

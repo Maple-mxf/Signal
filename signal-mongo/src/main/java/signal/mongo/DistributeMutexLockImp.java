@@ -93,7 +93,7 @@ public final class DistributeMutexLockImp extends DistributeMongoSignalBase
   @Keep
   @GuardedBy("varHandle")
   @VisibleForTesting
-  StateVars<Boolean> stateVars;
+  StatefulVar<Boolean> stateVars;
 
   private final VarHandle varHandle;
 
@@ -101,11 +101,11 @@ public final class DistributeMutexLockImp extends DistributeMongoSignalBase
       Lease lease, String key, MongoClient mongoClient, MongoDatabase db, EventBus eventBus) {
     super(lease, key, mongoClient, db, MUTEX_LOCK_NAMED);
 
-    this.stateVars = new StateVars<>(false);
+    this.stateVars = new StatefulVar<>(false);
     try {
       varHandle =
           MethodHandles.lookup()
-              .findVarHandle(DistributeMutexLockImp.class, "stateVars", StateVars.class);
+              .findVarHandle(DistributeMutexLockImp.class, "stateVars", StatefulVar.class);
     } catch (NoSuchFieldException | IllegalAccessException e) {
       throw new IllegalStateException();
     }
@@ -121,7 +121,7 @@ public final class DistributeMutexLockImp extends DistributeMongoSignalBase
     Document holder = currHolder();
     BiFunction<ClientSession, MongoCollection<Document>, TxnResponse> command =
         (session, coll) -> {
-          StateVars<Boolean> currState = (StateVars<Boolean>) varHandle.getAcquire(this);
+          StatefulVar<Boolean> currState = (StatefulVar<Boolean>) varHandle.getAcquire(this);
           int currStateAddr = identityHashCode(currState);
 
           Document mutex = coll.find(session, eq("_id", this.getKey())).first();
@@ -146,7 +146,7 @@ public final class DistributeMutexLockImp extends DistributeMongoSignalBase
           Optional<Document> optional = extractHolder(mutex, holder);
           if (optional.isEmpty() && !holdersEmpty) {
             if (identityHashCode(
-                    varHandle.compareAndExchangeRelease(this, currState, new StateVars<>(true)))
+                    varHandle.compareAndExchangeRelease(this, currState, new StatefulVar<>(true)))
                 == currStateAddr) {
               return parkThread();
             }
@@ -177,7 +177,7 @@ public final class DistributeMutexLockImp extends DistributeMongoSignalBase
           parkCurrentThreadUntil(
               lock,
               available,
-              () -> ((StateVars<Boolean>) varHandle.getAcquire(this)).value,
+              () -> ((StatefulVar<Boolean>) varHandle.getAcquire(this)).value,
               timed,
               s,
               (waitTimeNanos - (nanoTime() - s)));
@@ -321,10 +321,10 @@ public final class DistributeMutexLockImp extends DistributeMongoSignalBase
     if (!holdersEmpty) return;
 
     for (; ; ) {
-      StateVars<Integer> currState = (StateVars<Integer>) varHandle.getAcquire(this);
+      StatefulVar<Integer> currState = (StatefulVar<Integer>) varHandle.getAcquire(this);
       int currStateAddr = identityHashCode(currState);
       if (identityHashCode(
-              varHandle.compareAndExchangeRelease(this, currState, new StateVars<>(false)))
+              varHandle.compareAndExchangeRelease(this, currState, new StatefulVar<>(false)))
           == currStateAddr) {
         unparkSuccessor(lock, available, false);
         return;

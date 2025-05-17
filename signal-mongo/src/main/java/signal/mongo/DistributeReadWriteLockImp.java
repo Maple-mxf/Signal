@@ -133,7 +133,7 @@ public final class DistributeReadWriteLockImp extends DistributeMongoSignalBase
   @Keep
   @GuardedBy("varHandle")
   @VisibleForTesting
-  final StateVars<String> stateVars;
+  final StatefulVar<String> stateVars;
 
   private final VarHandle varHandle;
 
@@ -149,11 +149,11 @@ public final class DistributeReadWriteLockImp extends DistributeMongoSignalBase
       Lease lease, String key, MongoClient mongoClient, MongoDatabase db, EventBus eventBus) {
     super(lease, key, mongoClient, db, READ_WRITE_LOCK_NAMED);
 
-    this.stateVars = new StateVars<>("");
+    this.stateVars = new StatefulVar<>("");
     try {
       varHandle =
           MethodHandles.lookup()
-              .findVarHandle(DistributeReadWriteLockImp.class, "stateVars", StateVars.class);
+              .findVarHandle(DistributeReadWriteLockImp.class, "stateVars", StatefulVar.class);
     } catch (NoSuchFieldException | IllegalAccessException e) {
       throw new IllegalStateException(e);
     }
@@ -205,8 +205,8 @@ public final class DistributeReadWriteLockImp extends DistributeMongoSignalBase
           (session, coll) -> {
 
             // 执行之前先获取state的值，避免和wakeHead函数并发更新state的值冲突
-            StateVars<String> currState =
-                (StateVars<String>) varHandle.getAcquire(DistributeWriteLockImp.this);
+            StatefulVar<String> currState =
+                (StatefulVar<String>) varHandle.getAcquire(DistributeWriteLockImp.this);
 
             Document writeLock = coll.find(session, eq("_id", this.getKey())).first();
             if (writeLock == null) {
@@ -228,7 +228,7 @@ public final class DistributeReadWriteLockImp extends DistributeMongoSignalBase
               if (identityHashCode(currState)
                   == identityHashCode(
                       varHandle.compareAndExchangeRelease(
-                          DistributeReadWriteLockImp.this, currState, new StateVars<>("r")))) {
+                          DistributeReadWriteLockImp.this, currState, new StatefulVar<>("r")))) {
                 return parkThread();
               }
               return retryableError();
@@ -260,8 +260,8 @@ public final class DistributeReadWriteLockImp extends DistributeMongoSignalBase
                 available,
                 () -> {
                   @SuppressWarnings("UnnecessaryParentheses")
-                  StateVars<String> sv =
-                      (StateVars<String>) varHandle.getAcquire(DistributeReadWriteLockImp.this);
+                  StatefulVar<String> sv =
+                      (StatefulVar<String>) varHandle.getAcquire(DistributeReadWriteLockImp.this);
                   return !sv.value.isEmpty();
                 },
                 timed,
@@ -378,8 +378,8 @@ public final class DistributeReadWriteLockImp extends DistributeMongoSignalBase
           (session, coll) -> {
 
             // 执行之前先获取state revision的值，避免和wakeHead函数并发更新state的值冲突
-            StateVars<String> currState =
-                (StateVars<String>) varHandle.getAcquire(DistributeReadWriteLockImp.this);
+            StatefulVar<String> currState =
+                (StatefulVar<String>) varHandle.getAcquire(DistributeReadWriteLockImp.this);
 
             Document readLock = coll.find(session, eq("_id", this.getKey())).first();
             if (readLock == null) {
@@ -403,7 +403,7 @@ public final class DistributeReadWriteLockImp extends DistributeMongoSignalBase
               if (identityHashCode(currState)
                   == identityHashCode(
                       varHandle.compareAndExchangeRelease(
-                          DistributeReadWriteLockImp.this, currState, new StateVars<>("w")))) {
+                          DistributeReadWriteLockImp.this, currState, new StatefulVar<>("w")))) {
                 return parkThread();
               }
               return retryableError();
@@ -443,8 +443,8 @@ public final class DistributeReadWriteLockImp extends DistributeMongoSignalBase
                 available,
                 () -> {
                   @SuppressWarnings("UnnecessaryParentheses")
-                  StateVars<String> sv =
-                      ((StateVars<String>) (varHandle.getAcquire(DistributeReadWriteLockImp.this)));
+                  StatefulVar<String> sv =
+                      ((StatefulVar<String>) (varHandle.getAcquire(DistributeReadWriteLockImp.this)));
                   return sv == null || sv.value.isEmpty() || "r".equals(sv.value);
                 },
                 timed,
@@ -626,8 +626,8 @@ public final class DistributeReadWriteLockImp extends DistributeMongoSignalBase
     Next:
     for (; ; ) {
       // 执行之前先获取state的值，避免和lock函数并发更新state的值冲突
-      StateVars<String> currState =
-          (StateVars<String>) varHandle.getAcquire(DistributeReadWriteLockImp.this);
+      StatefulVar<String> currState =
+          (StatefulVar<String>) varHandle.getAcquire(DistributeReadWriteLockImp.this);
 
       // 当fullDocument为空时，对应的锁数据被删除的操作
       if (fullDocument == null || holders == null || holders.isEmpty()) {
@@ -635,7 +635,7 @@ public final class DistributeReadWriteLockImp extends DistributeMongoSignalBase
         if (identityHashCode(currState)
             == identityHashCode(
                 varHandle.compareAndExchangeRelease(
-                    DistributeReadWriteLockImp.this, currState, new StateVars<>("")))) {
+                    DistributeReadWriteLockImp.this, currState, new StatefulVar<>("")))) {
           // 将锁的可用状态置空 代表可以执行读锁尝试 也可以执行写锁尝试
           unparkSuccessor(false);
           return;
@@ -650,7 +650,7 @@ public final class DistributeReadWriteLockImp extends DistributeMongoSignalBase
         if (identityHashCode(currState)
             == identityHashCode(
                 varHandle.compareAndExchangeRelease(
-                    DistributeReadWriteLockImp.this, currState, new StateVars<>("r")))) {
+                    DistributeReadWriteLockImp.this, currState, new StatefulVar<>("r")))) {
           // 在写锁模式下，将锁的可用状态设置为r，代表读锁线程可以尝试着获取锁资源
           unparkSuccessor(false);
           return;

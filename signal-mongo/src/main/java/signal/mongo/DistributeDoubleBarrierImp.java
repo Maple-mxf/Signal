@@ -4,11 +4,9 @@ import static com.google.common.base.Preconditions.checkArgument;
 import static com.mongodb.client.model.Filters.and;
 import static com.mongodb.client.model.Filters.elemMatch;
 import static com.mongodb.client.model.Filters.eq;
-import static com.mongodb.client.model.Updates.addToSet;
 import static com.mongodb.client.model.Updates.combine;
 import static com.mongodb.client.model.Updates.inc;
 import static com.mongodb.client.model.Updates.set;
-import static com.mongodb.client.model.Updates.setOnInsert;
 import static signal.mongo.CollectionNamed.DOUBLE_BARRIER_NAMED;
 import static signal.mongo.MongoErrorCode.DuplicateKey;
 import static signal.mongo.MongoErrorCode.LockBusy;
@@ -87,8 +85,7 @@ final class DistributeDoubleBarrierImp extends DistributeMongoSignalBase
       int participants,
       EventBus eventBus) {
     super(lease, key, mongoClient, db, DOUBLE_BARRIER_NAMED);
-    checkArgument(participants > 0, "The value of participants must be greater than 0.");
-
+    checkArgument(participants > 0);
     this.lock = new ReentrantLock();
     this.entered = lock.newCondition();
     this.leaved = lock.newCondition();
@@ -105,16 +102,19 @@ final class DistributeDoubleBarrierImp extends DistributeMongoSignalBase
   @Override
   public void enter() throws InterruptedException {
     checkState();
-    TxnResponse txnResponse = this.doEnter();
-    if (txnResponse.thrownError) throw new SignalException(txnResponse.message);
 
-    if (txnResponse.parkThread) {
-      lock.lock();
-      try {
-        entered.await();
-      } finally {
-        lock.unlock();
-      }
+    for (;;){
+        TxnResponse rsp = this.doEnter();
+        if (rsp.thrownError)
+            throw new SignalException(rsp.message);
+        if (rsp.parkThread) {
+            lock.lock();
+            try {
+                entered.await();
+            } finally {
+                lock.unlock();
+            }
+        }
     }
   }
 
@@ -123,7 +123,6 @@ final class DistributeDoubleBarrierImp extends DistributeMongoSignalBase
     BiFunction<ClientSession, MongoCollection<Document>, TxnResponse> command =
         (session, coll) -> {
           Document doubleBarrier;
-
           if ((doubleBarrier = coll.find(session, eq("_id", this.getKey())).first()) == null) {
             InsertOneResult insertOneResult =
                 coll.insertOne(
@@ -135,19 +134,6 @@ final class DistributeDoubleBarrierImp extends DistributeMongoSignalBase
                 ? parkThreadWithSuccess()
                 : retryableError();
           }
-
-
-
-          if ((doubleBarrier =
-                  coll.findOneAndUpdate(
-                      session,
-                      eq("_id", this.getKey()),
-                      combine(
-                          setOnInsert("p", this.participants()),
-                          addToSet("o", holder),
-                          inc("v", 1L)),
-                          FU_UPSERT_OPTIONS))
-              == null) return retryableError();
 
           int p = doubleBarrier.getInteger("p");
           if (p != this.participants)
@@ -195,7 +181,8 @@ final class DistributeDoubleBarrierImp extends DistributeMongoSignalBase
                           eq("thread", holder.get("thread")),
                           eq("lease", holder.get("lease")))));
           var update = combine(set("o.$.state", 0), inc("v", 1L));
-          Document doubleBarrier = coll.findOneAndUpdate(session, filter, update, FU_UPDATE_OPTIONS);
+          Document doubleBarrier =
+              coll.findOneAndUpdate(session, filter, update, FU_UPDATE_OPTIONS);
           Optional<Document> optional;
           if (doubleBarrier == null || (optional = extractHolder(doubleBarrier, holder)).isEmpty())
             return thrownAnError(

@@ -8,10 +8,10 @@ import java.util.Objects;
  * @param <T> 可以是基础类型，将普通变量保障成StateVar的目的是为了防止CAS更新的ABA问题 因为包装的对象可以会有1个唯一的内存地址
  */
 @Immutable(containerOf = "T")
-final class StateVars<T> {
+final class StatefulVar<T> {
   final T value;
 
-  StateVars(T value) {
+  StatefulVar(T value) {
     this.value = value;
   }
 
@@ -19,7 +19,7 @@ final class StateVars<T> {
   public boolean equals(Object o) {
     if (this == o) return true;
     if (o == null || getClass() != o.getClass()) return false;
-    StateVars<?> stateVars = (StateVars<?>) o;
+    StatefulVar<?> stateVars = (StatefulVar<?>) o;
     return Objects.equals(value, stateVars.value);
   }
 

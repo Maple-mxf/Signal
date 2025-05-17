@@ -14,21 +14,21 @@ public class StateVarTest {
 
   VarHandle varHandle;
 
-  StateVars<Long> stateVars;
+  StatefulVar<Long> stateVars;
 
   @Before
   public void setup() throws NoSuchFieldException, IllegalAccessException {
-    stateVars = new StateVars<>(0L);
+    stateVars = new StatefulVar<>(0L);
     varHandle =
-        MethodHandles.lookup().findVarHandle(StateVarTest.class, "stateVars", StateVars.class);
+        MethodHandles.lookup().findVarHandle(StateVarTest.class, "stateVars", StatefulVar.class);
   }
 
   @Test
   public void test0() {
-    StateVars<Long> _state = (StateVars<Long>) varHandle.getAcquire(this);
+    StatefulVar<Long> _state = (StatefulVar<Long>) varHandle.getAcquire(this);
     int c = System.identityHashCode(_state);
     Object object =
-        varHandle.compareAndExchangeRelease(this, _state, new StateVars<>(_state.value + 1L));
+        varHandle.compareAndExchangeRelease(this, _state, new StatefulVar<>(_state.value + 1L));
     System.err.println(c);
     System.err.println(System.identityHashCode(object));
     System.err.println(stateVars.value);
@@ -47,11 +47,11 @@ public class StateVarTest {
           }
 
           for (; ; ) {
-            StateVars<Long> _state = (StateVars<Long>) varHandle.getAcquire(this);
+            StatefulVar<Long> _state = (StatefulVar<Long>) varHandle.getAcquire(this);
             int c = System.identityHashCode(_state);
             Object object =
                 varHandle.compareAndExchangeRelease(
-                    this, _state, new StateVars<>(_state.value + 1L));
+                    this, _state, new StatefulVar<>(_state.value + 1L));
             if (c == System.identityHashCode(object)) break;
             System.err.println(11111);
           }

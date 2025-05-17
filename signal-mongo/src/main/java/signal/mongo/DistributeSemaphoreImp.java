@@ -117,7 +117,7 @@ public class DistributeSemaphoreImp extends DistributeMongoSignalBase
   @Keep
   @GuardedBy("varHandle")
   @VisibleForTesting
-  StateVars<Integer> stateVars;
+  StatefulVar<Integer> stateVars;
 
   // Acquire 语义
   // 1. 保证当前线程在交换操作后，能够“获得”并看到所有其他线程在交换之前已经做出的更新。
@@ -138,11 +138,11 @@ public class DistributeSemaphoreImp extends DistributeMongoSignalBase
     this.eventBus = eventBus;
     this.eventBus.register(this);
     this.permits = permits;
-    this.stateVars = new StateVars<>(0);
+    this.stateVars = new StatefulVar<>(0);
     try {
       this.varHandle =
           MethodHandles.lookup()
-              .findVarHandle(DistributeSemaphoreImp.class, "stateVars", StateVars.class);
+              .findVarHandle(DistributeSemaphoreImp.class, "stateVars", StatefulVar.class);
     } catch (NoSuchFieldException | IllegalAccessException e) {
       throw new IllegalStateException();
     }
@@ -171,7 +171,7 @@ public class DistributeSemaphoreImp extends DistributeMongoSignalBase
 
     BiFunction<ClientSession, MongoCollection<Document>, TxnResponse> command =
         (session, collection) -> {
-          StateVars<Integer> currState = (StateVars<Integer>) varHandle.getAcquire(this);
+          StatefulVar<Integer> currState = (StatefulVar<Integer>) varHandle.getAcquire(this);
           int currStateAddr = identityHashCode(currState);
 
           Document sem = collection.find(session, eq("_id", this.getKey())).first();
@@ -198,7 +198,7 @@ public class DistributeSemaphoreImp extends DistributeMongoSignalBase
           // 当许可的可用数量小于申请的许可数量时，则阻塞当前线程
           if (available < permits) {
             if (identityHashCode(
-                    varHandle.compareAndExchangeRelease(this, currState, new StateVars<>(occupied)))
+                    varHandle.compareAndExchangeRelease(this, currState, new StatefulVar<>(occupied)))
                 == currStateAddr) {
               return parkThread(); // TODO 返回parkThread没有意义
             }
@@ -255,7 +255,7 @@ public class DistributeSemaphoreImp extends DistributeMongoSignalBase
               // 可用的许可数量 = 总许可数量 - 已占用的许可数量
               () ->
                   permits
-                      >= (this.permits() - ((StateVars<Integer>) varHandle.getAcquire(this)).value),
+                      >= (this.permits() - ((StatefulVar<Integer>) varHandle.getAcquire(this)).value),
               timed,
               s,
               (waitTimeNanos - (nanoTime() - s)));
@@ -354,14 +354,14 @@ public class DistributeSemaphoreImp extends DistributeMongoSignalBase
     Predicate<TxnResponse> resRetryablePolicy =
         txnResult -> !txnResult.txnOk && txnResult.retryable;
 
-    TxnResponse outbound =
+    TxnResponse rsp =
         commandExecutor.loopExecute(
             command,
             commandExecutor.defaultDBErrorHandlePolicy(NoSuchTransaction, WriteConflict),
             null,
             resRetryablePolicy);
 
-    if (outbound.thrownError) throw new SignalException(outbound.message);
+    if (rsp.thrownError) throw new SignalException(rsp.message);
   }
 
   public void forceReleaseAll() {
@@ -406,7 +406,7 @@ public class DistributeSemaphoreImp extends DistributeMongoSignalBase
     lock.lock();
     try {
       // 只唤醒头部节点
-      if (((StateVars<Integer>) this.varHandle.getAcquire(this)).value < permits()) {
+      if (((StatefulVar<Integer>) this.varHandle.getAcquire(this)).value < permits()) {
         notFull.signal();
       }
     } finally {
@@ -427,13 +427,13 @@ public class DistributeSemaphoreImp extends DistributeMongoSignalBase
 
     Next:
     for (; ; ) {
-      StateVars<Integer> currState = (StateVars<Integer>) varHandle.getAcquire(this);
+      StatefulVar<Integer> currState = (StatefulVar<Integer>) varHandle.getAcquire(this);
       int currStateAddr = identityHashCode(currState);
 
       // 代表删除操作
       if (event.fullDocument() == null) {
         if (identityHashCode(
-                varHandle.compareAndExchangeRelease(this, currState, new StateVars<>(0)))
+                varHandle.compareAndExchangeRelease(this, currState, new StatefulVar<>(0)))
             == currStateAddr) {
           this.doUnparkSuccessor();
           return;
@@ -447,7 +447,7 @@ public class DistributeSemaphoreImp extends DistributeMongoSignalBase
               .sum();
       if (identityHashCode(
               varHandle.compareAndExchangeRelease(
-                  this, currState, new StateVars<>(occupiedPermits)))
+                  this, currState, new StatefulVar<>(occupiedPermits)))
           == currStateAddr) {
         this.doUnparkSuccessor();
         return;
