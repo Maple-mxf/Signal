@@ -57,7 +57,7 @@ public class DistributeSemaphoreTest extends BaseResourceSetup {
 
     TimeUnit.SECONDS.sleep(5);
     System.err.println("准备revoke lease");
-    System.err.println(semaphore.stateVars);
+    System.err.println(semaphore.statefulVar);
   }
 
   @Test

@@ -6,8 +6,7 @@ import java.util.Collection;
 public interface Shared {
 
   /**
-   * @return 返回持有共享信号量所有权的持有者信息 {@link Holder}
+   * @return 返回持有共享信号量所有权的持有者信息
    */
-  @Deprecated
-  Collection<Holder> getHolders();
+  <P> Collection<P> getPartnerNum();
 }

@@ -11,18 +11,17 @@ import static com.mongodb.client.model.Updates.pull;
 import static com.mongodb.client.model.Updates.set;
 import static java.lang.System.identityHashCode;
 import static java.lang.System.nanoTime;
-import static java.util.Collections.emptyList;
-import static java.util.Optional.ofNullable;
 import static java.util.concurrent.TimeUnit.NANOSECONDS;
 import static signal.mongo.CollectionNamed.SEMAPHORE_NAMED;
+import static signal.mongo.CommonTxnResponse.ok;
+import static signal.mongo.CommonTxnResponse.retryableError;
+import static signal.mongo.CommonTxnResponse.thrownAnError;
 import static signal.mongo.MongoErrorCode.DuplicateKey;
+import static signal.mongo.MongoErrorCode.LockBusy;
 import static signal.mongo.MongoErrorCode.LockFailed;
+import static signal.mongo.MongoErrorCode.LockTimeout;
 import static signal.mongo.MongoErrorCode.NoSuchTransaction;
 import static signal.mongo.MongoErrorCode.WriteConflict;
-import static signal.mongo.TxnResponse.ok;
-import static signal.mongo.TxnResponse.parkThread;
-import static signal.mongo.TxnResponse.retryableError;
-import static signal.mongo.TxnResponse.thrownAnError;
 import static signal.mongo.Utils.parkCurrentThreadUntil;
 
 import com.google.auto.service.AutoService;
@@ -42,7 +41,9 @@ import com.mongodb.client.result.DeleteResult;
 import com.mongodb.client.result.InsertOneResult;
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.VarHandle;
+import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.TimeUnit;
@@ -51,10 +52,12 @@ import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.BiFunction;
 import java.util.function.Predicate;
 import org.bson.Document;
+import org.bson.conversions.Bson;
 import signal.api.DistributeSemaphore;
-import signal.api.Holder;
 import signal.api.Lease;
 import signal.api.SignalException;
+import signal.mongo.pojo.SemaphoreDocument;
+import signal.mongo.pojo.SemaphoreOwnerDocument;
 
 /**
  * 信号量维护一个整数计数值，这个值表示可用资源的数量或许可证数。
@@ -102,13 +105,15 @@ import signal.api.SignalException;
  */
 @ThreadSafe
 @AutoService({DistributeSemaphore.class})
-public class DistributeSemaphoreImp extends DistributeMongoSignalBase
+public class DistributeSemaphoreImp extends DistributeMongoSignalBase<SemaphoreDocument>
     implements DistributeSemaphore {
   private final EventBus eventBus;
   private final int permits;
 
   private final ReentrantLock lock = new ReentrantLock();
   private final Condition notFull = lock.newCondition();
+
+  private final boolean allowReleaseWithoutAcquire;
 
   // 建立内存屏障
   // 确保写操作的顺序性：防止某些写操作被重新排序到屏障之前
@@ -117,7 +122,7 @@ public class DistributeSemaphoreImp extends DistributeMongoSignalBase
   @Keep
   @GuardedBy("varHandle")
   @VisibleForTesting
-  StatefulVar<Integer> stateVars;
+  StatefulVar<Integer> statefulVar;
 
   // Acquire 语义
   // 1. 保证当前线程在交换操作后，能够“获得”并看到所有其他线程在交换之前已经做出的更新。
@@ -134,28 +139,46 @@ public class DistributeSemaphoreImp extends DistributeMongoSignalBase
       MongoDatabase db,
       int permits,
       EventBus eventBus) {
+    this(lease, key, mongoClient, db, permits, eventBus, true);
+  }
+
+  DistributeSemaphoreImp(
+      Lease lease,
+      String key,
+      MongoClient mongoClient,
+      MongoDatabase db,
+      int permits,
+      EventBus eventBus,
+      boolean allowReleaseWithoutAcquire) {
     super(lease, key, mongoClient, db, SEMAPHORE_NAMED);
+    this.allowReleaseWithoutAcquire = allowReleaseWithoutAcquire;
     this.eventBus = eventBus;
     this.eventBus.register(this);
     this.permits = permits;
-    this.stateVars = new StatefulVar<>(0);
+    this.statefulVar = new StatefulVar<>(0);
     try {
       this.varHandle =
           MethodHandles.lookup()
-              .findVarHandle(DistributeSemaphoreImp.class, "stateVars", StatefulVar.class);
+              .findVarHandle(DistributeSemaphoreImp.class, "statefulVar", StatefulVar.class);
     } catch (NoSuchFieldException | IllegalAccessException e) {
       throw new IllegalStateException();
     }
   }
 
-  Document currHolder() {
-    return new Document("lease", this.getLease().getLeaseID());
+  private SemaphoreOwnerDocument buildCurrentOwner(int permits) {
+    return new SemaphoreOwnerDocument(
+        Utils.getCurrentHostname(),
+        this.getLease().getLeaseID(),
+        allowReleaseWithoutAcquire ? "" : Utils.getCurrentThreadName(),
+        permits);
   }
 
-  Optional<Document> extractHolder(Document signal, Document holder) {
-    List<Document> holders = signal.getList("o", Document.class);
-    if (holders == null || holders.isEmpty()) return Optional.empty();
-    return holders.stream().filter(t -> t.get("lease").equals(holder.get("lease"))).findFirst();
+  private Bson buildOwnerFilter(SemaphoreOwnerDocument owner) {
+    List<Bson> andConditions = new ArrayList<>(8);
+    andConditions.add(eq("hostname", owner.hostname()));
+    andConditions.add(eq("lease", owner.lease()));
+    if (!allowReleaseWithoutAcquire) andConditions.add(eq("thread", owner.thread()));
+    return and(andConditions);
   }
 
   @Override
@@ -166,78 +189,67 @@ public class DistributeSemaphoreImp extends DistributeMongoSignalBase
         String.format(
             "The requested permits [%d] exceed the limit [%d].", permits, this.permits()));
 
-    Document holder = currHolder();
-    holder.put("acquire_permits", permits);
+    SemaphoreOwnerDocument thisOwner = this.buildCurrentOwner(permits);
 
-    BiFunction<ClientSession, MongoCollection<Document>, TxnResponse> command =
+    BiFunction<ClientSession, MongoCollection<SemaphoreDocument>, CommonTxnResponse> command =
         (session, collection) -> {
+          @SuppressWarnings("unchecked")
           StatefulVar<Integer> currState = (StatefulVar<Integer>) varHandle.getAcquire(this);
-          int currStateAddr = identityHashCode(currState);
+          int currStateHashCode = identityHashCode(currState);
 
-          Document sem = collection.find(session, eq("_id", this.getKey())).first();
-          if (sem == null) {
-            InsertOneResult insertResult =
-                collection.insertOne(
-                    session,
-                    new Document("_id", this.getKey())
-                        .append("p", this.permits())
-                        .append("o", ImmutableList.of(holder))
-                        .append("v", 1L));
+          SemaphoreDocument sd = collection.find(session, eq("_id", this.getKey())).first();
+          if (sd == null) {
+            sd = new SemaphoreDocument(this.key, this.permits, ImmutableList.of(thisOwner), 1L);
+            InsertOneResult insertResult = collection.insertOne(session, sd);
             return insertResult.getInsertedId() != null ? ok() : retryableError();
           }
-          int p = sem.getInteger("p");
-          if (p != this.permits()) return thrownAnError("Semaphore permits inconsistency.");
+          if (sd.permits() != this.permits())
+            return thrownAnError("Semaphore permits inconsistency.");
 
           // 已占用的permits数量，如果可用数量小于申请的数量，则Blocking当前Thread
-          int occupied =
-              sem.getList("o", Document.class).stream()
-                  .mapToInt(t -> t.getInteger("acquire_permits"))
-                  .sum();
+          int occupied = sd.owners().stream().mapToInt(SemaphoreOwnerDocument::acquirePermits).sum();
           int available = this.permits() - occupied;
 
           // 当许可的可用数量小于申请的许可数量时，则阻塞当前线程
           if (available < permits) {
             if (identityHashCode(
-                    varHandle.compareAndExchangeRelease(this, currState, new StatefulVar<>(occupied)))
-                == currStateAddr) {
-              return parkThread(); // TODO 返回parkThread没有意义
+                    varHandle.compareAndExchangeRelease(
+                        this, currState, new StatefulVar<>(occupied)))
+                == currStateHashCode) {
+              return ok();
             }
             return retryableError();
           }
-
-          Optional<Document> optional = extractHolder(sem, holder);
+          Optional<SemaphoreOwnerDocument> optional =
+              sd.owners().stream().filter(o -> o.equals(thisOwner)).findFirst();
           if (optional.isPresent()) {
             // 当前Thread已获得的许可数量
-            int acquired = optional.get().getInteger("acquire_permits");
-
-            // TODO 评估这个逻辑是否合理
+            int acquired = optional.get().acquirePermits();
             if ((acquired + permits) > this.permits())
               return thrownAnError("Maximum permit count exceeded");
           }
 
-          long revision = sem.getLong("v"), newRevision = revision + 1;
+          long version = sd.version(), newVersion = version + 1;
           var filter =
               optional.isPresent()
                   ? and(
-                      eq("_id", this.getKey()),
-                      eq("v", revision),
-                      elemMatch("o", eq("lease", holder.get("lease"))))
-                  : and(eq("_id", this.getKey()), eq("v", revision));
+                      eq("_id", key),
+                      eq("version", version),
+                      elemMatch("owners", buildOwnerFilter(thisOwner)))
+                  : and(eq("_id", this.getKey()), eq("version", version));
           var updates =
               optional
                   .map(
                       value ->
                           combine(
-                              set(
-                                  "o.$.acquire_permits",
-                                  value.getInteger("acquire_permits") + permits),
-                              inc("v", 1)))
-                  .orElseGet(() -> combine(addToSet("o", holder), inc("v", 1L)));
+                              set("owners.$.acquire_permits", value.acquirePermits() + permits),
+                              inc("version", 1)))
+                  .orElseGet(() -> combine(addToSet("owners", thisOwner), inc("version", 1L)));
 
-          return ((sem = collection.findOneAndUpdate(session, filter, updates, UPDATE_OPTIONS))
+          return ((sd = collection.findOneAndUpdate(session, filter, updates, UPDATE_OPTIONS))
                       != null
-                  && extractHolder(sem, holder).isPresent()
-                  && sem.getLong("v") == newRevision)
+                  && sd.containOwner(thisOwner)
+                  && sd.version() == newVersion)
               ? ok()
               : retryableError();
         };
@@ -255,7 +267,8 @@ public class DistributeSemaphoreImp extends DistributeMongoSignalBase
               // 可用的许可数量 = 总许可数量 - 已占用的许可数量
               () ->
                   permits
-                      >= (this.permits() - ((StatefulVar<Integer>) varHandle.getAcquire(this)).value),
+                      >= (this.permits()
+                          - ((StatefulVar<Integer>) varHandle.getAcquire(this)).value),
               timed,
               s,
               (waitTimeNanos - (nanoTime() - s)));
@@ -263,13 +276,13 @@ public class DistributeSemaphoreImp extends DistributeMongoSignalBase
 
       checkState();
 
-      TxnResponse rsp =
+      CommonTxnResponse rsp =
           commandExecutor.loopExecute(
               command,
               commandExecutor.defaultDBErrorHandlePolicy(
                   NoSuchTransaction, DuplicateKey, LockFailed),
               null,
-              t -> !t.txnOk && t.retryable && !t.thrownError && !t.parkThread,
+              t -> !t.txnOk && t.retryable && !t.thrownError,
               timed,
               timed ? (waitTimeNanos - (nanoTime() - s)) : -1L,
               NANOSECONDS);
@@ -313,18 +326,21 @@ public class DistributeSemaphoreImp extends DistributeMongoSignalBase
         String.format(
             "The requested permits [%d] exceed the limit [%d].", permits, this.permits()));
 
-    var holder = currHolder();
-    BiFunction<ClientSession, MongoCollection<Document>, TxnResponse> command =
-        (session, collection) -> {
-          Document sem = collection.find(session, eq("_id", this.getKey())).first();
-          Optional<Document> optional;
-          if (sem == null
-              || sem.getInteger("p") != this.permits()
-              || (optional = extractHolder(sem, holder)).isEmpty())
+    SemaphoreOwnerDocument thisOwner = buildCurrentOwner(-1);
+
+    BiFunction<ClientSession, MongoCollection<SemaphoreDocument>, CommonTxnResponse> command =
+        (session, coll) -> {
+          SemaphoreDocument sd = coll.find(session, eq("_id", this.getKey())).first();
+
+          Optional<SemaphoreOwnerDocument> thatOwnerOption;
+
+          if (sd == null
+              || sd.permits() != this.permits
+              || (thatOwnerOption = sd.getThatOwner(thisOwner)).isEmpty())
             return thrownAnError(
                 "Semaphore not exists or permits inconsistency or current thread does not hold a permits.");
 
-          int acquired = optional.get().getInteger("acquire_permits");
+          int acquired = thatOwnerOption.get().acquirePermits();
           int unreleased = acquired - permits;
           if (unreleased < 0)
             return thrownAnError(
@@ -332,29 +348,28 @@ public class DistributeSemaphoreImp extends DistributeMongoSignalBase
                     "The current thread holds %d permits and is not allowed to release %d permits",
                     acquired, permits));
 
-          long revision = sem.getLong("v"), newRevision = revision + 1;
-          var filter = and(eq("_id", this.getKey()), eq("v", revision));
+          long version = sd.version(), newVersion = version + 1;
+          var filter = and(eq("_id", this.getKey()), eq("version", version));
 
           // 达到删除的条件
-          if (unreleased == 0L && sem.getList("o", Document.class).size() == 1) {
-            DeleteResult deleteResult = collection.deleteOne(session, filter);
+          if (unreleased == 0L && sd.ownerCount() == 1) {
+            DeleteResult deleteResult = coll.deleteOne(session, filter);
             return deleteResult.getDeletedCount() == 1L ? ok() : retryableError();
           }
           var update =
               unreleased > 0
-                  ? combine(inc("v", 1), set("o.$.acquire_permits", unreleased))
-                  : combine(inc("v", 1), pull("o", eq("lease", holder.get("lease"))));
-          return ((sem = collection.findOneAndUpdate(session, filter, update, UPDATE_OPTIONS))
-                      != null
-                  && sem.getLong("v") == newRevision)
+                  ? combine(inc("version", 1), set("owners.$.acquire_permits", unreleased))
+                  : combine(inc("version", 1), pull("owners", buildOwnerFilter(thisOwner)));
+          return ((sd = coll.findOneAndUpdate(session, filter, update, UPDATE_OPTIONS)) != null
+                  && sd.version() == newVersion)
               ? ok()
               : retryableError();
         };
 
-    Predicate<TxnResponse> resRetryablePolicy =
+    Predicate<CommonTxnResponse> resRetryablePolicy =
         txnResult -> !txnResult.txnOk && txnResult.retryable;
 
-    TxnResponse rsp =
+    CommonTxnResponse rsp =
         commandExecutor.loopExecute(
             command,
             commandExecutor.defaultDBErrorHandlePolicy(NoSuchTransaction, WriteConflict),
@@ -365,41 +380,38 @@ public class DistributeSemaphoreImp extends DistributeMongoSignalBase
   }
 
   public void forceReleaseAll() {
-    BiFunction<ClientSession, MongoCollection<Document>, TxnResponse> command =
+    BiFunction<ClientSession, MongoCollection<SemaphoreDocument>, Boolean> command =
         (session, coll) -> {
-          Document sem = coll.find(session, eq("_id", this.getKey())).first();
-          if (sem == null || this.permits() != sem.getInteger("p")) return ok();
+          SemaphoreDocument sd = coll.find(session, eq("_id", this.getKey())).first();
+          if (sd == null || this.permits() != sd.permits()) return true;
 
-          List<Document> holders = ofNullable(sem.getList("o", Document.class)).orElse(emptyList());
-          if (holders.stream()
-              .noneMatch(t -> this.getLease().getLeaseID().equals(t.getString("lease")))) {
-            return ok();
+          List<SemaphoreOwnerDocument> thisOwners = sd.owners();
+          if (thisOwners.stream().noneMatch(t -> this.getLease().getLeaseID().equals(t.lease()))) {
+            return true;
           }
-          long revision = sem.getLong("v"), newRevision = revision + 1L;
+          long version = sd.version(), newVersion = version + 1L;
           var filter =
-              and(eq("_id", this.getKey()), eq("v", sem.getLong("v")), eq("p", this.permits()));
-          if (holders.isEmpty()
-              || holders.stream()
-                  .allMatch(t -> t.getString("lease").equals(getLease().getLeaseID()))) {
+              and(
+                  eq("_id", this.getKey()),
+                  eq("version", sd.version()),
+                  eq("permits", this.permits()));
+          if (thisOwners.isEmpty()
+              || thisOwners.stream().allMatch(t -> t.lease().equals(getLease().getLeaseID()))) {
             DeleteResult deleteResult = coll.deleteOne(session, filter);
-            return deleteResult.getDeletedCount() == 1L ? ok() : retryableError();
+            return deleteResult.getDeletedCount() == 1L;
           }
-
-          var update = combine(pull("o", eq("lease", getLease().getLeaseID())), inc("v", 1));
-          return ((sem = coll.findOneAndUpdate(session, filter, update)) != null
-                  && sem.getLong("v") == newRevision)
-              ? ok()
-              : retryableError();
+          var update =
+              combine(pull("owners", eq("lease", getLease().getLeaseID())), inc("version", 1));
+          return (sd = coll.findOneAndUpdate(session, filter, update)) != null
+              && sd.version() == newVersion;
         };
-
-    TxnResponse outbound =
-        commandExecutor.loopExecute(
-            command,
-            commandExecutor.defaultDBErrorHandlePolicy(
-                NoSuchTransaction, WriteConflict, LockFailed),
-            null,
-            t -> !t.txnOk && t.retryable);
-    if (outbound.thrownError) throw new SignalException(outbound.message);
+    for (; ; ) {
+      if (commandExecutor.loopExecute(
+          command,
+          commandExecutor.defaultDBErrorHandlePolicy(NoSuchTransaction, WriteConflict),
+          null,
+          t -> !t)) break;
+    }
   }
 
   private void doUnparkSuccessor() {
@@ -428,13 +440,13 @@ public class DistributeSemaphoreImp extends DistributeMongoSignalBase
     Next:
     for (; ; ) {
       StatefulVar<Integer> currState = (StatefulVar<Integer>) varHandle.getAcquire(this);
-      int currStateAddr = identityHashCode(currState);
+      int currStateHashCode = identityHashCode(currState);
 
       // 代表删除操作
       if (event.fullDocument() == null) {
         if (identityHashCode(
                 varHandle.compareAndExchangeRelease(this, currState, new StatefulVar<>(0)))
-            == currStateAddr) {
+            == currStateHashCode) {
           this.doUnparkSuccessor();
           return;
         }
@@ -442,15 +454,15 @@ public class DistributeSemaphoreImp extends DistributeMongoSignalBase
         continue Next;
       }
       int occupiedPermits =
-          event.fullDocument().getList("o", Document.class).stream()
+          event.fullDocument().getList("owners", Document.class).stream()
               .mapToInt(t -> t.getInteger("acquire_permits"))
               .sum();
       if (identityHashCode(
               varHandle.compareAndExchangeRelease(
                   this, currState, new StatefulVar<>(occupiedPermits)))
-          == currStateAddr) {
+          == currStateHashCode) {
         this.doUnparkSuccessor();
-        return;
+        break Next;
       }
       Thread.onSpinWait();
       continue Next;
@@ -463,8 +475,8 @@ public class DistributeSemaphoreImp extends DistributeMongoSignalBase
   }
 
   @Override
-  public Collection<Holder> getHolders() {
-    return super.doGetHolders();
+  public boolean allowReleaseWithoutAcquire() {
+    return allowReleaseWithoutAcquire;
   }
 
   @Override
@@ -472,5 +484,23 @@ public class DistributeSemaphoreImp extends DistributeMongoSignalBase
     this.eventBus.unregister(this);
     this.forceReleaseAll();
     Utils.unparkSuccessor(lock, notFull, true);
+  }
+
+  @Override
+  public <P> Collection<P> getPartnerNum() {
+    BiFunction<ClientSession, MongoCollection<SemaphoreDocument>, List<SemaphoreOwnerDocument>>
+        command =
+            (session, coll) -> {
+              var filter = eq("_id", getKey());
+              SemaphoreDocument document = coll.find(filter).limit(1).first();
+              return document == null ? Collections.emptyList() : document.owners();
+            };
+    return (Collection<P>)
+        commandExecutor.loopExecute(
+            command,
+            commandExecutor.defaultDBErrorHandlePolicy(
+                LockBusy, LockFailed, LockTimeout, NoSuchTransaction),
+            null,
+            t -> false);
   }
 }

@@ -21,10 +21,10 @@ import static signal.mongo.CollectionNamed.MUTEX_LOCK_NAMED;
 import static signal.mongo.MongoErrorCode.DuplicateKey;
 import static signal.mongo.MongoErrorCode.NoSuchTransaction;
 import static signal.mongo.MongoErrorCode.WriteConflict;
-import static signal.mongo.TxnResponse.ok;
-import static signal.mongo.TxnResponse.parkThread;
-import static signal.mongo.TxnResponse.retryableError;
-import static signal.mongo.TxnResponse.thrownAnError;
+import static signal.mongo.CommonTxnResponse.ok;
+import static signal.mongo.CommonTxnResponse.parkThread;
+import static signal.mongo.CommonTxnResponse.retryableError;
+import static signal.mongo.CommonTxnResponse.thrownAnError;
 import static signal.mongo.Utils.mappedHolder2AndFilter;
 import static signal.mongo.Utils.parkCurrentThreadUntil;
 import static signal.mongo.Utils.unparkSuccessor;
@@ -119,7 +119,7 @@ public final class DistributeMutexLockImp extends DistributeMongoSignalBase
   @Override
   public boolean tryLock(Long waitTime, TimeUnit timeUnit) throws InterruptedException {
     Document holder = currHolder();
-    BiFunction<ClientSession, MongoCollection<Document>, TxnResponse> command =
+    BiFunction<ClientSession, MongoCollection<Document>, CommonTxnResponse> command =
         (session, coll) -> {
           StatefulVar<Boolean> currState = (StatefulVar<Boolean>) varHandle.getAcquire(this);
           int currStateAddr = identityHashCode(currState);
@@ -185,7 +185,7 @@ public final class DistributeMutexLockImp extends DistributeMongoSignalBase
 
       checkState();
 
-      TxnResponse rsp =
+      CommonTxnResponse rsp =
           commandExecutor.loopExecute(
               command,
               commandExecutor.defaultDBErrorHandlePolicy(
@@ -206,7 +206,7 @@ public final class DistributeMutexLockImp extends DistributeMongoSignalBase
     checkState();
 
     Document holder = currHolder();
-    BiFunction<ClientSession, MongoCollection<Document>, TxnResponse> command =
+    BiFunction<ClientSession, MongoCollection<Document>, CommonTxnResponse> command =
         (session, coll) -> {
           Document mutex =
               coll.find(
@@ -236,7 +236,7 @@ public final class DistributeMutexLockImp extends DistributeMongoSignalBase
               ? ok()
               : retryableError();
         };
-    TxnResponse rsp =
+    CommonTxnResponse rsp =
         commandExecutor.loopExecute(
             command,
             commandExecutor.defaultDBErrorHandlePolicy(NoSuchTransaction, WriteConflict),
@@ -335,7 +335,7 @@ public final class DistributeMutexLockImp extends DistributeMongoSignalBase
 
   // TODO Force Unlock API
   private void forceUnlock() {
-    BiFunction<ClientSession, MongoCollection<Document>, TxnResponse> command =
+    BiFunction<ClientSession, MongoCollection<Document>, CommonTxnResponse> command =
         (session, coll) -> {
           Document mutex =
               coll.find(
@@ -350,7 +350,7 @@ public final class DistributeMutexLockImp extends DistributeMongoSignalBase
           return deleteResult.getDeletedCount() == 1L ? ok() : retryableError();
         };
 
-    TxnResponse rsp =
+    CommonTxnResponse rsp =
         commandExecutor.loopExecute(
             command,
             commandExecutor.defaultDBErrorHandlePolicy(NoSuchTransaction, WriteConflict),

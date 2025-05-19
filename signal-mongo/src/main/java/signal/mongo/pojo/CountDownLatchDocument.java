@@ -10,4 +10,9 @@ public record CountDownLatchDocument(
     @BsonProperty("count") Integer count,
     @BsonProperty("cc") Integer cc,
     @BsonProperty("waiters") List<CountDownLatchWaiterDocument> waiters,
-    @BsonProperty("version") Long version) {}
+    @BsonProperty("version") Long version) {
+
+  public boolean containWaiter(CountDownLatchWaiterDocument waiter) {
+    return this.waiters.contains(waiter);
+  }
+}

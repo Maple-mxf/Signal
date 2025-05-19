@@ -95,4 +95,6 @@ public interface DistributeSemaphore extends DistributeSignal, Shared {
    * @return 返回初始化的许可数量
    */
   int permits();
+
+  boolean allowReleaseWithoutAcquire();
 }

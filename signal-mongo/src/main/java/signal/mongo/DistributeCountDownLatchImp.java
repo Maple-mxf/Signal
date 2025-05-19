@@ -10,12 +10,12 @@ import static java.lang.System.identityHashCode;
 import static java.lang.System.nanoTime;
 import static java.util.concurrent.TimeUnit.NANOSECONDS;
 import static signal.mongo.CollectionNamed.COUNT_DOWN_LATCH_NAMED;
+import static signal.mongo.CommonTxnResponse.ok;
+import static signal.mongo.CommonTxnResponse.retryableError;
+import static signal.mongo.CommonTxnResponse.thrownAnError;
 import static signal.mongo.MongoErrorCode.LockFailed;
 import static signal.mongo.MongoErrorCode.NoSuchTransaction;
 import static signal.mongo.MongoErrorCode.WriteConflict;
-import static signal.mongo.TxnResponse.ok;
-import static signal.mongo.TxnResponse.retryableError;
-import static signal.mongo.TxnResponse.thrownAnError;
 import static signal.mongo.Utils.parkCurrentThreadUntil;
 import static signal.mongo.Utils.unparkSuccessor;
 
@@ -37,17 +37,15 @@ import com.mongodb.client.result.InsertOneResult;
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.VarHandle;
 import java.util.Collection;
-import java.util.List;
-import java.util.Optional;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.BiFunction;
-import org.bson.Document;
 import signal.api.DistributeCountDownLatch;
-import signal.api.Holder;
 import signal.api.Lease;
 import signal.api.SignalException;
+import signal.mongo.pojo.CountDownLatchDocument;
+import signal.mongo.pojo.CountDownLatchWaiterDocument;
 
 /**
  * 数据存储格式
@@ -66,7 +64,7 @@ import signal.api.SignalException;
  */
 @ThreadSafe
 @AutoService(DistributeCountDownLatch.class)
-final class DistributeCountDownLatchImp extends DistributeMongoSignalBase
+final class DistributeCountDownLatchImp extends DistributeMongoSignalBase<CountDownLatchDocument>
     implements DistributeCountDownLatch {
   private final int count;
   private final EventBus eventBus;
@@ -82,7 +80,7 @@ final class DistributeCountDownLatchImp extends DistributeMongoSignalBase
   @Keep
   @GuardedBy("varHandle")
   @VisibleForTesting
-  StatefulVar<Integer> stateVars;
+  StatefulVar<Integer> statefulVar;
 
   // Acquire 语义
   // 1. 保证当前线程在交换操作后，能够“获得”并看到所有其他线程在交换之前已经做出的更新。
@@ -91,6 +89,14 @@ final class DistributeCountDownLatchImp extends DistributeMongoSignalBase
   // 1. 保证当前线程在交换操作之前，对共享变量的所有写操作（即交换操作之前的写操作）都已经完成，并且这些写操作对其他线程是可见的。
   // 2. 确保当前线程执行该交换操作之前，所有对共享数据的写操作已经对其他线程“发布”，使得其他线程能够正确看到这些更新。
   private final VarHandle varHandle;
+
+  @Override
+  public <P> Collection<P> getPartnerNum() {
+    return null;
+  }
+
+  private record InitCountDownLatchTxnResponse(
+      boolean success, boolean retryable, boolean thrownError, String message, int stateValue) {}
 
   DistributeCountDownLatchImp(
       Lease lease,
@@ -104,50 +110,63 @@ final class DistributeCountDownLatchImp extends DistributeMongoSignalBase
     this.count = count;
     this.lock = new ReentrantLock();
     this.countDone = lock.newCondition();
-
-    this.eventBus = eventBus;
-    this.eventBus.register(this);
-
     try {
       this.varHandle =
           MethodHandles.lookup()
-              .findVarHandle(DistributeCountDownLatchImp.class, "stateVars", StatefulVar.class);
+              .findVarHandle(DistributeCountDownLatchImp.class, "statefulVar", StatefulVar.class);
     } catch (NoSuchFieldException | IllegalAccessException e) {
-      throw new IllegalStateException();
+      throw new IllegalStateException(e);
     }
 
-    Document h = currHolder();
-    BiFunction<ClientSession, MongoCollection<Document>, TxnResponse> command =
-        (session, coll) -> {
-          Document cdl =
-              coll.findOneAndUpdate(
-                  session,
-                  eq("_id", this.getKey()),
-                  combine(
-                      setOnInsert("c", this.count),
-                      setOnInsert("cc", 0),
-                      setOnInsert("v", 1L),
-                      addToSet("o", h)),
+    CountDownLatchWaiterDocument thisWaiter = buildCurrentWaiter();
+    BiFunction<
+            ClientSession, MongoCollection<CountDownLatchDocument>, InitCountDownLatchTxnResponse>
+        command =
+            (session, coll) -> {
+              CountDownLatchDocument cdl =
+                  coll.findOneAndUpdate(
+                      session,
+                      eq("_id", this.getKey()),
+                      combine(
+                          setOnInsert("count", this.count),
+                          setOnInsert("cc", 0),
+                          setOnInsert("version", 1L),
+                          addToSet("waiters", thisWaiter)),
                       UPSERT_OPTIONS);
-          if (cdl == null) return retryableError();
-          if (cdl.getInteger("c") != this.count)
-            return thrownAnError(
-                "Count down error. Because another process is using count down latch resources");
-          this.stateVars = new StatefulVar<>(cdl.getInteger("cc"));
-          return ok();
-        };
+              if (cdl == null)
+                return new InitCountDownLatchTxnResponse(false, true, false, "", 0);
+              if (cdl.count() != this.count)
+                return new InitCountDownLatchTxnResponse(
+                    false,
+                    false,
+                    true,
+                    "Count down error. Because another process is using count down latch resources",
+                    0);
+              return new InitCountDownLatchTxnResponse(true, false, false, "", 0);
+            };
 
     for (; ; ) {
-      TxnResponse rsp =
+      InitCountDownLatchTxnResponse rsp =
           commandExecutor.loopExecute(
               command,
               commandExecutor.defaultDBErrorHandlePolicy(
                   LockFailed, NoSuchTransaction, WriteConflict),
               null,
-              t -> !t.txnOk && t.retryable && !t.thrownError);
-      if (rsp.txnOk) return;
+              t -> !t.success && t.retryable && !t.thrownError);
       if (rsp.thrownError) throw new SignalException(rsp.message);
+      if (rsp.success) {
+        this.statefulVar = new StatefulVar<>(rsp.stateValue);
+        break;
+      }
     }
+
+    this.eventBus = eventBus;
+    this.eventBus.register(this);
+  }
+
+  private CountDownLatchWaiterDocument buildCurrentWaiter() {
+    return new CountDownLatchWaiterDocument(
+        Utils.getCurrentHostname(), this.lease.getLeaseID(), Utils.getCurrentThreadName());
   }
 
   @Override
@@ -155,69 +174,52 @@ final class DistributeCountDownLatchImp extends DistributeMongoSignalBase
     return count;
   }
 
-  Document currHolder() {
-    return new Document("lease", this.getLease().getLeaseID());
-  }
-
-  Optional<Document> extractHolder(Document signal, Document holder) {
-    List<Document> holders = signal.getList("o", Document.class);
-    if (holders == null || holders.isEmpty()) return Optional.empty();
-    return holders.stream().filter(t -> t.get("lease").equals(holder.get("lease"))).findFirst();
-  }
-
   @Override
   public void countDown() {
-    Document holder = currHolder();
-
-    BiFunction<ClientSession, MongoCollection<Document>, TxnResponse> command =
+    CountDownLatchWaiterDocument thisWaiter = this.buildCurrentWaiter();
+    BiFunction<ClientSession, MongoCollection<CountDownLatchDocument>, CommonTxnResponse> command =
         (session, coll) -> {
-          Document cdl = coll.find(session, eq("_id", this.getKey())).first();
+          CountDownLatchDocument cdl = coll.find(session, eq("_id", this.getKey())).first();
           if (cdl == null) {
-            InsertOneResult insertOneResult =
-                coll.insertOne(
-                    new Document("_id", this.getKey())
-                        .append("c", this.count)
-                        .append("cc", 1)
-                        .append(
-                            "o",
-                            ImmutableList.of(new Document("lease", this.getLease().getLeaseID())))
-                        .append("v", 1L));
+            cdl = new CountDownLatchDocument(key, count, 1, ImmutableList.of(thisWaiter), 1L);
+            InsertOneResult insertOneResult = coll.insertOne(session, cdl);
             return (insertOneResult.getInsertedId() != null && insertOneResult.wasAcknowledged())
                 ? ok()
                 : retryableError();
           }
-          int cc = cdl.getInteger("cc");
-          if (cdl.getInteger("c") != this.count)
+          if (cdl.count() != this.count)
             return thrownAnError(
                 "Count down error. Because another process is using count down latch resources");
-          if (cc > this.count) return thrownAnError("Count down exceed.");
+          if (cdl.cc() > this.count) return thrownAnError("Count down exceed.");
 
-          long revision = cdl.getLong("v"), newRevision = revision + 1;
-          var filter = and(eq("_id", this.getKey()), eq("v", revision));
+          long version = cdl.version(), newVersion = version + 1;
+          var filter = and(eq("_id", this.getKey()), eq("version", version));
 
           // 到达删除条件
-          if (cc + 1 == this.count) {
+          if (cdl.cc() + 1 == this.count) {
             DeleteResult deleteResult = coll.deleteOne(session, filter);
             return deleteResult.getDeletedCount() == 1L ? ok() : retryableError();
           }
-          var updates = combine(inc("cc", 1), inc("v", 1), addToSet("o", holder));
+          var updates = combine(inc("cc", 1), inc("version", 1), addToSet("waiters", thisWaiter));
           return ((cdl = collection.findOneAndUpdate(session, filter, updates, UPDATE_OPTIONS))
                       != null
-                  && extractHolder(cdl, holder).isPresent()
-                  && cdl.getLong("v") == newRevision)
+                  && cdl.containWaiter(thisWaiter)
+                  && cdl.version() == newVersion)
               ? ok()
               : retryableError();
         };
-    TxnResponse rsp =
-        commandExecutor.loopExecute(
-            command,
-            commandExecutor.defaultDBErrorHandlePolicy(
-                LockFailed, NoSuchTransaction, WriteConflict),
-            null,
-            t -> !t.txnOk && t.retryable && !t.thrownError);
-    if (rsp.txnOk) return;
-    if (rsp.thrownError) throw new SignalException(rsp.message);
-    throw new SignalException("Unknown Error.");
+
+    for (; ; ) {
+      CommonTxnResponse rsp =
+          commandExecutor.loopExecute(
+              command,
+              commandExecutor.defaultDBErrorHandlePolicy(
+                  LockFailed, NoSuchTransaction, WriteConflict),
+              null,
+              t -> !t.txnOk && t.retryable && !t.thrownError);
+      if (rsp.txnOk) break;
+      if (rsp.thrownError) throw new SignalException(rsp.message);
+    }
   }
 
   @Override
@@ -257,13 +259,13 @@ final class DistributeCountDownLatchImp extends DistributeMongoSignalBase
     Next:
     for (; ; ) {
       StatefulVar<Integer> currState = (StatefulVar<Integer>) varHandle.getAcquire(this);
-      int currStateAddr = identityHashCode(currState);
+      int currStateHashCode = identityHashCode(currState);
 
       // 代表删除操作
       if (event.fullDocument() == null) {
         if (identityHashCode(
                 varHandle.compareAndExchangeRelease(this, currState, new StatefulVar<>(this.count)))
-            == currStateAddr) {
+            == currStateHashCode) {
           unparkSuccessor(lock, countDone, true);
           return;
         }
@@ -273,16 +275,11 @@ final class DistributeCountDownLatchImp extends DistributeMongoSignalBase
       int cc = event.cc();
       if (identityHashCode(
               varHandle.compareAndExchangeRelease(this, currState, new StatefulVar<>(cc)))
-          == currStateAddr) {
+          == currStateHashCode) {
         return;
       }
       Thread.onSpinWait();
       continue Next;
     }
-  }
-
-  @Override
-  public Collection<Holder> getHolders() {
-    return super.doGetHolders();
   }
 }

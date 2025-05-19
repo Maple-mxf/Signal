@@ -19,10 +19,10 @@ import static signal.mongo.MongoErrorCode.LockFailed;
 import static signal.mongo.MongoErrorCode.NoSuchTransaction;
 import static signal.mongo.MongoErrorCode.TransactionExceededLifetimeLimitSeconds;
 import static signal.mongo.MongoErrorCode.WriteConflict;
-import static signal.mongo.TxnResponse.ok;
-import static signal.mongo.TxnResponse.parkThread;
-import static signal.mongo.TxnResponse.retryableError;
-import static signal.mongo.TxnResponse.thrownAnError;
+import static signal.mongo.CommonTxnResponse.ok;
+import static signal.mongo.CommonTxnResponse.parkThread;
+import static signal.mongo.CommonTxnResponse.retryableError;
+import static signal.mongo.CommonTxnResponse.thrownAnError;
 import static signal.mongo.Utils.mappedHolder2AndFilter;
 import static signal.mongo.Utils.parkCurrentThreadUntil;
 
@@ -124,7 +124,7 @@ public final class DistributeReadWriteLockImp extends DistributeMongoSignalBase
    *
    * <ul>
    *   <li>C操作对应的线程更新state成功， C操作将state的值更新为 "" 空字符串，表示当前锁资源可用，B操作更新state失败，会在事务内部返回{@link
-   *       TxnResponse#retryableError()}，C操作进行重试，读到当前锁资源可用，整个过程不存在脏读或者{@link
+   *       CommonTxnResponse#retryableError()}，C操作进行重试，读到当前锁资源可用，整个过程不存在脏读或者{@link
    *       DistributeReadWriteLockImp#awakeSuccessor(ChangeStreamEvents.ReadWriteLockChangeAndRemovedEvent)}函数错过没有挂起的线程
    *   <li>B操作对应的线程更新state成功，假设此时B操作读到了脏数据（A操作提交之前的数据版本）， B操作将state的值更新为 "r"，表示当前锁资源不可用，B操作挂起线程，
    *       C操作唤醒挂起的线程，整个过程即使存在脏读的情况，但是依然会保证结果的正确性
@@ -201,7 +201,7 @@ public final class DistributeReadWriteLockImp extends DistributeMongoSignalBase
     public boolean tryLock(Long waitTime, TimeUnit timeUnit) throws InterruptedException {
       Document holder = currHolder();
 
-      BiFunction<ClientSession, MongoCollection<Document>, TxnResponse> command =
+      BiFunction<ClientSession, MongoCollection<Document>, CommonTxnResponse> command =
           (session, coll) -> {
 
             // 执行之前先获取state的值，避免和wakeHead函数并发更新state的值冲突
@@ -272,7 +272,7 @@ public final class DistributeReadWriteLockImp extends DistributeMongoSignalBase
 
         checkState();
 
-        TxnResponse outbound =
+        CommonTxnResponse outbound =
             commandExecutor.loopExecute(
                 command,
                 commandExecutor.defaultDBErrorHandlePolicy(
@@ -308,7 +308,7 @@ public final class DistributeReadWriteLockImp extends DistributeMongoSignalBase
       checkState();
       Document holder = currHolder();
 
-      BiFunction<ClientSession, MongoCollection<Document>, TxnResponse> command =
+      BiFunction<ClientSession, MongoCollection<Document>, CommonTxnResponse> command =
           (session, coll) -> {
             DeleteResult deleteResult =
                 coll.deleteOne(
@@ -333,7 +333,7 @@ public final class DistributeReadWriteLockImp extends DistributeMongoSignalBase
                 ? ok()
                 : thrownAnError("The current instance does not hold a write lock.");
           };
-      TxnResponse txnResponse =
+      CommonTxnResponse txnResponse =
           commandExecutor.loopExecute(
               command,
               commandExecutor.defaultDBErrorHandlePolicy(
@@ -374,7 +374,7 @@ public final class DistributeReadWriteLockImp extends DistributeMongoSignalBase
     @Override
     public boolean tryLock(Long waitTime, TimeUnit timeUnit) throws InterruptedException {
       Document holder = currHolder();
-      BiFunction<ClientSession, MongoCollection<Document>, TxnResponse> command =
+      BiFunction<ClientSession, MongoCollection<Document>, CommonTxnResponse> command =
           (session, coll) -> {
 
             // 执行之前先获取state revision的值，避免和wakeHead函数并发更新state的值冲突
@@ -456,7 +456,7 @@ public final class DistributeReadWriteLockImp extends DistributeMongoSignalBase
         // 循环检查状态
         checkState();
 
-        TxnResponse txnResponse =
+        CommonTxnResponse txnResponse =
             commandExecutor.loopExecute(
                 command,
                 commandExecutor.defaultDBErrorHandlePolicy(
@@ -490,7 +490,7 @@ public final class DistributeReadWriteLockImp extends DistributeMongoSignalBase
       checkState();
       Document holder = currHolder();
 
-      BiFunction<ClientSession, MongoCollection<Document>, TxnResponse> command =
+      BiFunction<ClientSession, MongoCollection<Document>, CommonTxnResponse> command =
           (session, coll) -> {
             Document readLock =
                 coll.find(session, and(eq("_id", this.getKey()), eq("m", READ_MODE))).first();
@@ -525,7 +525,7 @@ public final class DistributeReadWriteLockImp extends DistributeMongoSignalBase
                 : retryableError();
           };
 
-      TxnResponse outbound =
+      CommonTxnResponse outbound =
           commandExecutor.loopExecute(
               command,
               commandExecutor.defaultDBErrorHandlePolicy(
@@ -571,7 +571,7 @@ public final class DistributeReadWriteLockImp extends DistributeMongoSignalBase
   }
 
   private void forceUnlock() {
-    BiFunction<ClientSession, MongoCollection<Document>, TxnResponse> command =
+    BiFunction<ClientSession, MongoCollection<Document>, CommonTxnResponse> command =
         (session, coll) -> {
           Document lock = coll.find(session, eq("_id", this.getKey())).first();
           if (lock == null) return ok();
@@ -599,7 +599,7 @@ public final class DistributeReadWriteLockImp extends DistributeMongoSignalBase
               : retryableError();
         };
 
-    TxnResponse txnResponse =
+    CommonTxnResponse txnResponse =
         commandExecutor.loopExecute(
             command,
             commandExecutor.defaultDBErrorHandlePolicy(

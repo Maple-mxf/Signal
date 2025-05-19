@@ -1,51 +1,44 @@
 package signal.mongo;
 
-import static com.mongodb.client.model.Aggregates.match;
-import static com.mongodb.client.model.Aggregates.project;
 import static com.mongodb.client.model.Filters.and;
 import static com.mongodb.client.model.Filters.eq;
-import static com.mongodb.client.model.Filters.type;
-import static com.mongodb.client.model.Projections.computed;
-import static com.mongodb.client.model.Projections.excludeId;
-import static com.mongodb.client.model.Projections.fields;
 import static com.mongodb.client.model.Updates.addToSet;
 import static com.mongodb.client.model.Updates.combine;
 import static com.mongodb.client.model.Updates.inc;
 import static com.mongodb.client.model.Updates.setOnInsert;
-import static java.util.Collections.emptySet;
-import static java.util.Optional.ofNullable;
-import static java.util.stream.Collectors.toSet;
+import static java.lang.System.identityHashCode;
+import static java.lang.System.nanoTime;
 import static signal.mongo.CollectionNamed.BARRIER_NAMED;
 import static signal.mongo.MongoErrorCode.LockBusy;
 import static signal.mongo.MongoErrorCode.LockFailed;
 import static signal.mongo.MongoErrorCode.LockTimeout;
 import static signal.mongo.MongoErrorCode.NoSuchTransaction;
 import static signal.mongo.MongoErrorCode.WriteConflict;
-import static signal.mongo.TxnResponse.ok;
-import static signal.mongo.TxnResponse.parkThreadWithSuccess;
-import static signal.mongo.TxnResponse.retryableError;
+import static signal.mongo.Utils.parkCurrentThreadUntil;
 
 import com.google.auto.service.AutoService;
-import com.google.common.collect.ImmutableList;
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.eventbus.EventBus;
 import com.google.common.eventbus.Subscribe;
 import com.google.errorprone.annotations.DoNotCall;
+import com.google.errorprone.annotations.Keep;
 import com.google.errorprone.annotations.ThreadSafe;
+import com.google.errorprone.annotations.concurrent.GuardedBy;
 import com.mongodb.client.ClientSession;
 import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoCollection;
 import com.mongodb.client.MongoDatabase;
 import com.mongodb.client.result.DeleteResult;
+import java.lang.invoke.MethodHandles;
+import java.lang.invoke.VarHandle;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.BiFunction;
-import org.bson.BsonType;
-import org.bson.Document;
 import signal.api.DistributeBarrier;
-import signal.api.Holder;
 import signal.api.Lease;
 import signal.api.SignalException;
 import signal.mongo.pojo.BarrierDocument;
@@ -78,6 +71,13 @@ public final class DistributeBarrierImp extends DistributeMongoSignalBase<Barrie
   private final Condition removed;
   private final EventBus eventBus;
 
+  @Keep
+  @GuardedBy("varHandle")
+  @VisibleForTesting
+  StatefulVar<Boolean> statefulVar;
+
+  private final VarHandle varHandle;
+
   public DistributeBarrierImp(
       Lease lease, String key, MongoClient mongoClient, MongoDatabase db, EventBus eventBus) {
     super(lease, key, mongoClient, db, BARRIER_NAMED);
@@ -85,63 +85,59 @@ public final class DistributeBarrierImp extends DistributeMongoSignalBase<Barrie
     this.removed = lock.newCondition();
     this.eventBus = eventBus;
 
-    BiFunction<ClientSession, MongoCollection<BarrierDocument>, TxnResponse> command =
-        (session, coll) -> {
-          BarrierDocument barrier =
-              coll.findOneAndUpdate(
-                  session,
-                  eq("_id", this.getKey()),
-                  combine(
-                      setOnInsert("_id", this.getKey()),
-                      setOnInsert("version", 1L),
-                      setOnInsert("waiters", Collections.emptyList())),
-                  UPSERT_OPTIONS);
-          return barrier == null ? retryableError() : ok();
-        };
-    for (; ; ) {
-      TxnResponse rsp =
-          commandExecutor.loopExecute(
-              command,
-              commandExecutor.defaultDBErrorHandlePolicy(WriteConflict),
-              null,
-              t -> !t.txnOk && t.retryable);
-      if (rsp.txnOk) break;
-      if (rsp.retryable) continue;
+    try {
+      this.varHandle =
+          MethodHandles.lookup()
+              .findVarHandle(DistributeBarrierImp.class, "statefulVar", StatefulVar.class);
+    } catch (NoSuchFieldException | IllegalAccessException e) {
+      throw new IllegalStateException();
     }
+
+    BiFunction<ClientSession, MongoCollection<BarrierDocument>, Boolean> command =
+        (session, coll) ->
+            coll.findOneAndUpdate(
+                    session,
+                    eq("_id", this.getKey()),
+                    combine(
+                        setOnInsert("_id", this.getKey()),
+                        setOnInsert("version", 1L),
+                        setOnInsert("waiters", Collections.emptyList())),
+                    UPSERT_OPTIONS)
+                != null;
+
+    for (; ; ) {
+      if (commandExecutor.loopExecute(
+          command,
+          commandExecutor.defaultDBErrorHandlePolicy(WriteConflict, NoSuchTransaction),
+          null,
+          t -> !t)) break;
+    }
+    this.statefulVar = new StatefulVar<>(true);
     this.eventBus.register(this);
   }
 
   @Override
-  public void await() throws InterruptedException {
+  public void await(Long waitTime, TimeUnit timeUnit) throws InterruptedException {
     checkState();
-    TxnResponse rsp;
-    while ((rsp = this.doWaitOnBarrier()).txnOk && !rsp.thrownError && rsp.parkThread) {
-      lock.lock();
-      try {
-        removed.await();
-      } finally {
-        lock.unlock();
-      }
-    }
-    if (rsp.thrownError) throw new SignalException(rsp.message);
-  }
-
-  private BarrierWaiterDocument buildCurrentWaiter() {
-    return new BarrierWaiterDocument(
-        Utils.getCurrentHostname(), this.getLease().getLeaseID(), Utils.getCurrentThreadName());
-  }
-
-  private TxnResponse doWaitOnBarrier() {
     BarrierWaiterDocument waiter = buildCurrentWaiter();
 
-    BiFunction<ClientSession, MongoCollection<BarrierDocument>, TxnResponse> command =
+    BiFunction<ClientSession, MongoCollection<BarrierDocument>, Boolean> command =
         (session, coll) -> {
-          var filter = eq("_id", getKey());
+          StatefulVar<Boolean> currState = (StatefulVar<Boolean>) varHandle.getAcquire(this);
+          int currStateHashCode = identityHashCode(currState);
 
+          var filter = eq("_id", getKey());
           BarrierDocument distributeBarrier;
 
           // 返回成功，但是不阻塞当前线程
-          if ((distributeBarrier = coll.find(session, filter).first()) == null) return ok();
+          if ((distributeBarrier = coll.find(session, filter).first()) == null) {
+            if (identityHashCode(
+                    varHandle.compareAndExchangeRelease(this, currState, new StatefulVar<>(true)))
+                == currStateHashCode) {
+              return true;
+            }
+            return false;
+          }
 
           long version = distributeBarrier.version(), newVersion = version + 1;
           var newFilter = and(filter, eq("version", version));
@@ -150,78 +146,120 @@ public final class DistributeBarrierImp extends DistributeMongoSignalBase<Barrie
           // 如果barrier为空，需要重试继续更新
           if ((distributeBarrier =
                   coll.findOneAndUpdate(session, newFilter, update, UPDATE_OPTIONS))
-              == null) return retryableError();
+              == null) return false;
 
           List<BarrierWaiterDocument> waiters = distributeBarrier.waiters();
-          return waiters != null && waiters.contains(waiter)
-              ? parkThreadWithSuccess()
-              : retryableError();
+          return waiters != null && waiters.contains(waiter);
         };
-    return commandExecutor.loopExecute(
-        command,
-        commandExecutor.defaultDBErrorHandlePolicy(
-            LockBusy, LockFailed, LockTimeout, WriteConflict, NoSuchTransaction),
-        null,
-        t -> !t.txnOk && t.retryable && !t.thrownError);
+
+    for (; ; ) {
+      if (commandExecutor.loopExecute(
+          command,
+          commandExecutor.defaultDBErrorHandlePolicy(WriteConflict, NoSuchTransaction),
+          null,
+          t -> !t)) break;
+    }
+
+    long s = nanoTime(), waitTimeNanos = timeUnit.toNanos(waitTime);
+    boolean timed = waitTime > 0;
+
+    boolean elapsed =
+        parkCurrentThreadUntil(
+            lock,
+            removed,
+            () -> ((StatefulVar<Boolean>) varHandle.getAcquire(this)).value,
+            timed,
+            s,
+            (waitTimeNanos - (nanoTime() - s)));
+    if (!elapsed) throw new SignalException("Timeout.");
+  }
+
+  private BarrierWaiterDocument buildCurrentWaiter() {
+    return new BarrierWaiterDocument(
+        Utils.getCurrentHostname(), this.getLease().getLeaseID(), Utils.getCurrentThreadName());
   }
 
   @Override
   public void removeBarrier() {
     checkState();
-    BiFunction<ClientSession, MongoCollection<Document>, TxnResponse> command =
+    BiFunction<ClientSession, MongoCollection<BarrierDocument>, Boolean> command =
         (session, coll) -> {
           var filter = eq("_id", getKey());
 
           // 如果要移除的Barrier不存在，则不向上抛出错误
-          Document barrier;
-          if ((barrier = coll.find(session, filter).first()) == null) return ok();
-          var newFilter = and(filter, eq("v", barrier.getLong("v")));
+          BarrierDocument barrier;
+          if ((barrier = coll.find(session, filter).first()) == null) return true;
+          var newFilter = and(filter, eq("version", barrier.version()));
           DeleteResult deleteResult = coll.deleteOne(session, newFilter);
-          var success = deleteResult.getDeletedCount() == 1L;
-          return success ? ok() : retryableError();
+          return deleteResult.getDeletedCount() == 1L;
         };
 
-    TxnResponse txnResponse =
-        commandExecutor.loopExecute(
-            command,
-            commandExecutor.defaultDBErrorHandlePolicy(
-                LockBusy, LockFailed, LockTimeout, WriteConflict, NoSuchTransaction),
-            null,
-            t -> !t.txnOk && t.retryable && !t.thrownError);
-    if (txnResponse.thrownError) throw new SignalException(txnResponse.message);
+    for (; ; ) {
+      if (commandExecutor.loopExecute(
+          command,
+          commandExecutor.defaultDBErrorHandlePolicy(WriteConflict, NoSuchTransaction),
+          null,
+          t -> !t)) break;
+    }
   }
 
   @Override
   public int getWaiterCount() {
-    Document barrier =
-        collection
-            .aggregate(
-                ImmutableList.of(
-                    match(and(eq("_id", this.getKey()), type("o", BsonType.ARRAY))),
-                    project(fields(computed("count", new Document("$size", "$o")), excludeId()))))
-            .first();
-    if (barrier == null || barrier.isEmpty()) return 0;
-    return ofNullable(barrier.get("count")).map(Object::toString).map(Integer::parseInt).orElse(0);
+    BiFunction<ClientSession, MongoCollection<BarrierDocument>, Integer> command =
+        (session, coll) -> {
+          var filter = eq("_id", getKey());
+          BarrierDocument document = coll.find(filter).limit(1).first();
+          return document == null ? 0 : document.waiters().size();
+        };
+    return commandExecutor.loopExecute(
+        command,
+        commandExecutor.defaultDBErrorHandlePolicy(
+            LockBusy, LockFailed, LockTimeout, NoSuchTransaction),
+        null,
+        t -> false);
   }
 
   @Override
-  public Collection<Holder> getHolders() {
-    Document document = collection.find(eq("_id", this.getKey())).first();
-    return ofNullable(document)
-        .map(doc -> doc.getList("o", Document.class))
-        .map(holders -> holders.stream().map(Utils::mappedDoc2Holder).collect(toSet()))
-        .orElse(emptySet());
+  public <P> Collection<P> getPartnerNum() {
+    BiFunction<ClientSession, MongoCollection<BarrierDocument>, List<BarrierWaiterDocument>>
+        command =
+            (session, coll) -> {
+              var filter = eq("_id", getKey());
+              BarrierDocument document = coll.find(filter).limit(1).first();
+              return document == null ? Collections.emptyList() : document.waiters();
+            };
+    List<BarrierWaiterDocument> barrierWaiterDocuments =
+        commandExecutor.loopExecute(
+            command,
+            commandExecutor.defaultDBErrorHandlePolicy(
+                LockBusy, LockFailed, LockTimeout, NoSuchTransaction),
+            null,
+            t -> false);
+    return (Collection<P>) barrierWaiterDocuments;
   }
 
   @DoNotCall
   @Subscribe
   void awakeAll(ChangeStreamEvents.BarrierRemovedEvent event) {
     if (!this.getKey().equals(event.barrierKey())) return;
-    lock.lock();
-    try {
-      removed.signalAll();
-    } finally {
-      lock.unlock();
+    Next:
+    for (; ; ) {
+      StatefulVar<Boolean> currState = (StatefulVar<Boolean>) varHandle.getAcquire(this);
+      int currStateHashCode = identityHashCode(currState);
+
+      if (identityHashCode(
+              varHandle.compareAndExchangeRelease(this, currState, new StatefulVar<>(false)))
+          == currStateHashCode) {
+        lock.lock();
+        try {
+          removed.signalAll();
+        } finally {
+          lock.unlock();
+        }
+        break Next;
+      }
+      Thread.onSpinWait();
+      continue Next;
     }
   }
 

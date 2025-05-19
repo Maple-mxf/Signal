@@ -41,11 +41,6 @@ abstract class DistributeMongoSignalBase<Doc> extends DistributeSignalBase {
           .writeConcern(WriteConcern.MAJORITY)
           .build();
 
-  @Deprecated
-  Document currHolder() {
-    return Utils.mappedHolder2Bson(
-        this.getLease().getLeaseID(), Holder.self(this.getLease().getLeaseID()));
-  }
 
   static final FindOneAndUpdateOptions UPSERT_OPTIONS =
       new FindOneAndUpdateOptions().upsert(true).returnDocument(ReturnDocument.AFTER);
@@ -72,6 +67,7 @@ abstract class DistributeMongoSignalBase<Doc> extends DistributeSignalBase {
     Preconditions.checkState(!closed, "Semaphore instance closed.");
   }
 
+  @Deprecated
   Optional<Document> extractHolder(Document signal, Document holder) {
     List<Document> holders = signal.getList("o", Document.class);
     if (holders == null || holders.isEmpty()) return Optional.empty();

@@ -2,6 +2,8 @@ package signal.api;
 
 import com.google.errorprone.annotations.ThreadSafe;
 
+import java.util.concurrent.TimeUnit;
+
 /**
  *
  *
@@ -43,7 +45,11 @@ public interface DistributeBarrier extends DistributeSignal, Shared {
    *
    * @throws InterruptedException 主线程deadline，wait状态的线程会抛出此错误
    */
-  void await() throws InterruptedException;
+  void await(Long waitTime, TimeUnit timeUnit) throws InterruptedException;
+
+  default void await() throws InterruptedException {
+    await(-1L, TimeUnit.MILLISECONDS);
+  }
 
   /** 移除障碍 */
   void removeBarrier();

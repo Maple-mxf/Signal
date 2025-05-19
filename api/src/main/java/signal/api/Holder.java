@@ -6,6 +6,7 @@ import com.google.errorprone.annotations.CheckReturnValue;
 import java.util.UUID;
 
 /** 资源持有者的信息 */
+@Deprecated
 @AutoValue
 public abstract class Holder {
 
