@@ -1,0 +1,60 @@
+---
+title: Distribute Signal
+description: Your first document
+---
+
+Welcome to the docs! You can start writing documents in `/content/docs`.
+
+## What is Next?
+
+<Cards>
+  <Card title="Learn more about Next.js" href="https://nextjs.org/docs" />
+  <Card title="Learn more about Fumadocs" href="https://fumadocs.vercel.app" />
+</Cards>
+
+```java title="DistributeSemaphore.java"
+  DistributeSemaphoreImp(
+      Lease lease,
+      String key,
+      MongoClient mongoClient,
+      MongoDatabase db,
+      int permits,
+      EventBus eventBus,
+      boolean allowReleaseWithoutAcquire) {
+    super(lease, key, mongoClient, db, SEMAPHORE_NAMED);
+    this.allowReleaseWithoutAcquire = allowReleaseWithoutAcquire;
+    this.eventBus = eventBus;
+    this.eventBus.register(this);
+    this.permits = permits;
+    this.statefulVar = new StatefulVar<>(0);
+    try {
+      this.varHandle =
+          MethodHandles.lookup()
+              .findVarHandle(DistributeSemaphoreImp.class, "statefulVar", StatefulVar.class);
+    } catch (NoSuchFieldException | IllegalAccessException e) {
+      throw new IllegalStateException();
+    }
+  }
+```
+
+<Mermaid
+  chart="
+graph TD;
+subgraph AA [Consumers]
+A[Mobile app];
+B[Web app];
+C[Node.js client];
+end
+subgraph BB [Services]
+E[REST API];
+F[GraphQL API];
+G[SOAP API];
+end
+Z[GraphQL API];
+A --> Z;
+B --> Z;
+C --> Z;
+Z --> E;
+Z --> F;
+Z --> G;"
+/>
