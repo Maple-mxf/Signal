@@ -41,7 +41,6 @@ abstract class DistributeMongoSignalBase<Doc> extends DistributeSignalBase {
           .writeConcern(WriteConcern.MAJORITY)
           .build();
 
-
   static final FindOneAndUpdateOptions UPSERT_OPTIONS =
       new FindOneAndUpdateOptions().upsert(true).returnDocument(ReturnDocument.AFTER);
 

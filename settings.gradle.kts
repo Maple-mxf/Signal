@@ -8,6 +8,6 @@ dependencyResolutionManagement {
     }
 }
 include("api")
-include("signal-mongo")
-include("signal-mongo-observation")
-include("signal-mongo-benchmark")
+include("core")
+include("observation")
+include("benchmark")

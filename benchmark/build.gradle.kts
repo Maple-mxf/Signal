@@ -2,7 +2,7 @@ plugins {
     id("java")
 }
 
-group = "signal.mongo.benchmark"
+group = "signal.benchmark"
 version = "1.0"
 
 repositories {

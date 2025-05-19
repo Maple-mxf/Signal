@@ -6,7 +6,7 @@ plugins {
     id("net.ltgt.errorprone") version "4.1.0"
 }
 
-group = "signal.mongo"
+group = "signal.core"
 version = "1.0"
 
 dependencies {

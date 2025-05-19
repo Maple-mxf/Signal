@@ -3,7 +3,7 @@ plugins {
     id("java-library")
 }
 
-group = "signal.mongo.observation"
+group = "signal.observation"
 version = "1.0"
 
 repositories {
@@ -11,7 +11,7 @@ repositories {
 }
 
 dependencies {
-    api(project(":signal-mongo"))
+    api(project(":core"))
 
     implementation(lib.bytebuddy)
     implementation(lib.bytebuddyagent)
