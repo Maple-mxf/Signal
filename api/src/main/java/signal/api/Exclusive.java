@@ -6,5 +6,5 @@ public interface Exclusive {
   /**
    * @return 返回信号量持有者的信息
    */
-  Holder getHolder();
+  Object getOwner();
 }

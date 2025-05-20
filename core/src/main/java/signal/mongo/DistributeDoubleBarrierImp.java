@@ -14,12 +14,15 @@ import static signal.mongo.CommonTxnResponse.ok;
 import static signal.mongo.CommonTxnResponse.retryableError;
 import static signal.mongo.CommonTxnResponse.thrownAnError;
 import static signal.mongo.MongoErrorCode.DuplicateKey;
+import static signal.mongo.MongoErrorCode.LockBusy;
+import static signal.mongo.MongoErrorCode.LockFailed;
+import static signal.mongo.MongoErrorCode.LockTimeout;
 import static signal.mongo.MongoErrorCode.NoSuchTransaction;
 import static signal.mongo.MongoErrorCode.WriteConflict;
 import static signal.mongo.Utils.parkCurrentThreadUntil;
+import static signal.mongo.Utils.unparkSuccessor;
 
 import com.google.auto.service.AutoService;
-import com.google.common.annotations.VisibleForTesting;
 import com.google.common.eventbus.EventBus;
 import com.google.common.eventbus.Subscribe;
 import com.google.errorprone.annotations.DoNotCall;
@@ -79,19 +82,29 @@ final class DistributeDoubleBarrierImp extends DistributeMongoSignalBase<DoubleB
   private final Condition entered;
   private final Condition leaved;
 
-  private final Condition wait;
-
-  // 表示是否该阻塞当前Thread的标记
+  /**
+   * 当{@link DoubleBarrierDocument#phase()} 等于 {@link DoubleBarrierPhase#ENTER} 并且enteredCount 小于
+   * {@link DistributeDoubleBarrierImp#participants()}时，挂起调用enter的线程
+   */
   @Keep
-  @GuardedBy("varHandle")
-  @VisibleForTesting
-  StatefulVar<Boolean> statefulVar;
+  @GuardedBy("enteredCountVarHandle")
+  StatefulVar<Integer> enteredCount;
 
-  private final VarHandle varHandle;
+  /**
+   * 当{@link DoubleBarrierDocument#phase()} 等于 {@link DoubleBarrierPhase#LEAVE} 并且unenteredCount
+   * 不等于0时，挂起调用leave方法的线程
+   */
+  @GuardedBy("unenteredCountVarHandle")
+  @Keep
+  StatefulVar<Integer> unenteredCount;
 
-  private final int partnerNum;
+  private final VarHandle enteredCountVarHandle;
+  private final VarHandle unenteredCountVarHandle;
+
+  private final int participantCount;
   private final EventBus eventBus;
 
+  // TODO 待商榷的类
   private record InitDoubleBarrierTxnResponse(
       boolean success, boolean retryable, boolean thrownError, String message) {}
 
@@ -100,76 +113,77 @@ final class DistributeDoubleBarrierImp extends DistributeMongoSignalBase<DoubleB
       String key,
       MongoClient mongoClient,
       MongoDatabase db,
-      int partnerNum,
+      int participantCount,
       EventBus eventBus) {
     super(lease, key, mongoClient, db, DOUBLE_BARRIER_NAMED);
-    if (partnerNum <= 0) throw new IllegalArgumentException();
+    if (participantCount <= 0) throw new IllegalArgumentException();
 
     this.lock = new ReentrantLock();
     this.entered = lock.newCondition();
     this.leaved = lock.newCondition();
-    this.wait = lock.newCondition();
-    this.partnerNum = partnerNum;
+    this.participantCount = participantCount;
 
     try {
-      this.varHandle =
+      this.enteredCountVarHandle =
           MethodHandles.lookup()
-              .findVarHandle(DistributeDoubleBarrierImp.class, "statefulVar", StatefulVar.class);
+              .findVarHandle(DistributeDoubleBarrierImp.class, "enteredCount", StatefulVar.class);
+      this.unenteredCountVarHandle =
+          MethodHandles.lookup()
+              .findVarHandle(DistributeDoubleBarrierImp.class, "unenteredCount", StatefulVar.class);
     } catch (NoSuchFieldException | IllegalAccessException e) {
       throw new IllegalStateException();
     }
 
-    BiFunction<ClientSession, MongoCollection<DoubleBarrierDocument>, InitDoubleBarrierTxnResponse>
-        command =
-            (session, coll) -> {
-              // 执行更新version的操作，保证事物读到的数据不是旧事物版本的数据
-              DoubleBarrierDocument dbd =
-                  coll.findOneAndUpdate(
-                      session,
-                      eq("_id", this.getKey()),
-                      combine(
-                          setOnInsert("_id", key),
-                          setOnInsert("partner_num", partnerNum),
-                          setOnInsert("partners", Collections.emptyList()),
-                          setOnInsert("phase", DoubleBarrierPhase.ENTER),
-                          inc("version", 1L)),
-                      UPSERT_OPTIONS);
-              if (dbd == null) return new InitDoubleBarrierTxnResponse(false, true, false, "");
-              if (dbd.partnerNum() != this.partnerNum) {
-                String message =
-                    String.format(
-                        """
+    BiFunction<ClientSession, MongoCollection<DoubleBarrierDocument>, CommonTxnResponse> command =
+        (session, coll) -> {
+          // 执行更新version的操作，保证事物读到的数据不是旧事物版本的数据
+          DoubleBarrierDocument dbd =
+              coll.findOneAndUpdate(
+                  session,
+                  eq("_id", this.getKey()),
+                  combine(
+                      setOnInsert("_id", key),
+                      setOnInsert("partner_num", participantCount),
+                      setOnInsert("partners", Collections.emptyList()),
+                      setOnInsert("phase", DoubleBarrierPhase.ENTER),
+                      inc("version", 1L)),
+                  UPSERT_OPTIONS);
+          if (dbd == null) return retryableError();
+          if (dbd.partnerNum() != this.participantCount) {
+            String message =
+                String.format(
+                    """
                                   The current number of participants is %d, which is not equal to the set number of %d.
                         """,
-                        this.partnerNum, dbd.partnerNum());
-                return new InitDoubleBarrierTxnResponse(false, false, true, message);
-              }
-
-              return new InitDoubleBarrierTxnResponse(true, false, false, "");
-            };
+                    this.participantCount, dbd.partnerNum());
+            return thrownAnError(message);
+          }
+          return ok();
+        };
 
     for (; ; ) {
-      InitDoubleBarrierTxnResponse rsp =
+      CommonTxnResponse rsp =
           commandExecutor.loopExecute(
               command,
               commandExecutor.defaultDBErrorHandlePolicy(
                   NoSuchTransaction, WriteConflict, DuplicateKey),
               null,
-              t -> !t.success && t.retryable && !t.thrownError);
-      if (rsp.success) {
-
-        break;
-      }
+              t -> !t.txnOk && t.retryable && !t.thrownError);
       if (rsp.thrownError) throw new SignalException(rsp.message);
+      if (rsp.txnOk) break;
     }
-    statefulVar = new StatefulVar<>(true);
+
+    // 初始化为阻塞的状态
+    enteredCount = new StatefulVar<>(0);
+    unenteredCount = new StatefulVar<>(participantCount);
+
     this.eventBus = eventBus;
     this.eventBus.register(this);
   }
 
   @Override
   public int participants() {
-    return partnerNum;
+    return participantCount;
   }
 
   private DoubleBarrierPartnerDocument buildCurrentPartner() {
@@ -184,7 +198,8 @@ final class DistributeDoubleBarrierImp extends DistributeMongoSignalBase<DoubleB
     BiFunction<ClientSession, MongoCollection<DoubleBarrierDocument>, CommonTxnResponse> command =
         (session, coll) -> {
           @SuppressWarnings("unchecked")
-          StatefulVar<Boolean> currState = (StatefulVar<Boolean>) varHandle.getAcquire(this);
+          StatefulVar<Integer> currState =
+              (StatefulVar<Integer>) enteredCountVarHandle.getAcquire(this);
           int currStateHashCode = identityHashCode(currState);
 
           DoubleBarrierDocument dbd;
@@ -192,7 +207,7 @@ final class DistributeDoubleBarrierImp extends DistributeMongoSignalBase<DoubleB
             dbd =
                 new DoubleBarrierDocument(
                     key,
-                    partnerNum,
+                    participantCount,
                     List.of(thisPartner),
                     participants() == 1 ? DoubleBarrierPhase.LEAVE : DoubleBarrierPhase.ENTER,
                     1L);
@@ -202,23 +217,21 @@ final class DistributeDoubleBarrierImp extends DistributeMongoSignalBase<DoubleB
             if (!success) return retryableError();
 
             if (identityHashCode(
-                    varHandle.compareAndExchangeRelease(
-                        this,
-                        currState,
-                        new StatefulVar<>(dbd.partnerNum() == dbd.partners().size())))
+                    enteredCountVarHandle.compareAndExchangeRelease(
+                        this, currState, new StatefulVar<>(dbd.partners().size())))
                 == currStateHashCode) {
               return ok();
             }
             return retryableError();
           }
 
-          if (dbd.partnerNum() != this.partnerNum)
+          if (dbd.partnerNum() != this.participantCount)
             return thrownAnError(
                 String.format(
                     """
                                 The current number of participants is %d, which is not equal to the set number of %d.
                     """,
-                    this.partnerNum, dbd.partnerNum()));
+                    this.participantCount, dbd.partnerNum()));
 
           if (dbd.phase() != DoubleBarrierPhase.ENTER)
             return thrownAnError("The current phase is not entering.");
@@ -228,20 +241,17 @@ final class DistributeDoubleBarrierImp extends DistributeMongoSignalBase<DoubleB
           Optional<DoubleBarrierPartnerDocument> thatPartnerOption =
               dbd.getThatPartner(thisPartner);
 
-          // 当前线程重复enter操作
           if (thatPartnerOption.isPresent()) {
             if (identityHashCode(
-                    varHandle.compareAndExchangeRelease(
-                        this,
-                        currState,
-                        new StatefulVar<>(dbd.partnerNum() == dbd.partners().size())))
+                    enteredCountVarHandle.compareAndExchangeRelease(
+                        this, currState, new StatefulVar<>(dbd.partners().size())))
                 == currStateHashCode) {
               return ok();
             }
             return retryableError();
           }
 
-          if (partners.size() >= this.partnerNum)
+          if (partners.size() >= this.participantCount)
             return thrownAnError("The current number of participants is overflow.");
 
           long version = dbd.version(), newVersion = version + 1;
@@ -255,7 +265,7 @@ final class DistributeDoubleBarrierImp extends DistributeMongoSignalBase<DoubleB
                                   inc("version", 1L),
                                   set(
                                       "phase",
-                                      (partners.size() + 1 == this.partnerNum)
+                                      (partners.size() + 1 == this.participantCount)
                                           ? DoubleBarrierPhase.LEAVE
                                           : DoubleBarrierPhase.ENTER)),
                               UPDATE_OPTIONS))
@@ -265,10 +275,8 @@ final class DistributeDoubleBarrierImp extends DistributeMongoSignalBase<DoubleB
 
           if (!success) return retryableError();
           if (identityHashCode(
-                  varHandle.compareAndExchangeRelease(
-                      this,
-                      currState,
-                      new StatefulVar<>(dbd.partnerNum() == dbd.partners().size())))
+                  enteredCountVarHandle.compareAndExchangeRelease(
+                      this, currState, new StatefulVar<>(dbd.partners().size())))
               == currStateHashCode) {
             return ok();
           }
@@ -288,11 +296,11 @@ final class DistributeDoubleBarrierImp extends DistributeMongoSignalBase<DoubleB
       if (!rsp.txnOk && rsp.retryable) continue Next;
       parkCurrentThreadUntil(
           lock,
-          wait,
+          entered,
           () -> {
             @SuppressWarnings("unchecked")
-            StatefulVar<Boolean> sv = (StatefulVar<Boolean>) varHandle.getAcquire(this);
-            return sv.value;
+            StatefulVar<Integer> sv = (StatefulVar<Integer>) enteredCountVarHandle.getAcquire(this);
+            return sv.value < participants();
           },
           false,
           0,
@@ -309,7 +317,8 @@ final class DistributeDoubleBarrierImp extends DistributeMongoSignalBase<DoubleB
     BiFunction<ClientSession, MongoCollection<DoubleBarrierDocument>, CommonTxnResponse> command =
         (session, coll) -> {
           @SuppressWarnings("unchecked")
-          StatefulVar<Boolean> currState = (StatefulVar<Boolean>) varHandle.getAcquire(this);
+          StatefulVar<Integer> currState =
+              (StatefulVar<Integer>) unenteredCountVarHandle.getAcquire(this);
           int currStateHashCode = identityHashCode(currState);
 
           DoubleBarrierDocument dbd;
@@ -317,19 +326,19 @@ final class DistributeDoubleBarrierImp extends DistributeMongoSignalBase<DoubleB
             return thrownAnError("Double barrier missing.");
           }
 
-          if (dbd.partnerNum() != this.partnerNum)
+          if (dbd.partnerNum() != this.participantCount)
             return thrownAnError(
                 String.format(
                     """
-                                The current number of participants is %d, which is not equal to the set number of %d.
-                                """,
-                    this.partnerNum, dbd.partnerNum()));
+                    The current number of participants is %d, which is not equal to the set number of %d.
+                    """,
+                    this.participantCount, dbd.partnerNum()));
 
           if (dbd.phase() != DoubleBarrierPhase.LEAVE)
             return thrownAnError("The current phase is not leaving.");
 
           List<DoubleBarrierPartnerDocument> partners = dbd.partners();
-          if (partners.size() > this.partnerNum)
+          if (partners.size() > this.participantCount)
             return thrownAnError("The current number of participants is overflow.");
 
           if (dbd.partners().size() == 1 && dbd.partners().contains(thisPartner)) {
@@ -340,7 +349,8 @@ final class DistributeDoubleBarrierImp extends DistributeMongoSignalBase<DoubleB
 
             if (!success) return retryableError();
             if (identityHashCode(
-                    varHandle.compareAndExchangeRelease(this, currState, new StatefulVar<>(false)))
+                    unenteredCountVarHandle.compareAndExchangeRelease(
+                        this, currState, new StatefulVar<>(0)))
                 == currStateHashCode) {
               return ok();
             }
@@ -368,8 +378,8 @@ final class DistributeDoubleBarrierImp extends DistributeMongoSignalBase<DoubleB
 
           if (!success) return retryableError();
           if (identityHashCode(
-                  varHandle.compareAndExchangeRelease(
-                      this, currState, new StatefulVar<>(!dbd.partners().isEmpty())))
+                  unenteredCountVarHandle.compareAndExchangeRelease(
+                      this, currState, new StatefulVar<>(dbd.partners().size())))
               == currStateHashCode) {
             return ok();
           }
@@ -388,11 +398,12 @@ final class DistributeDoubleBarrierImp extends DistributeMongoSignalBase<DoubleB
       if (!rsp.txnOk && rsp.retryable) continue Next;
       parkCurrentThreadUntil(
           lock,
-          wait,
+          leaved,
           () -> {
             @SuppressWarnings("unchecked")
-            StatefulVar<Boolean> sv = (StatefulVar<Boolean>) varHandle.getAcquire(this);
-            return sv.value;
+            StatefulVar<Integer> sv =
+                (StatefulVar<Integer>) unenteredCountVarHandle.getAcquire(this);
+            return sv.value > 0;
           },
           false,
           0,
@@ -404,15 +415,6 @@ final class DistributeDoubleBarrierImp extends DistributeMongoSignalBase<DoubleB
   @Override
   protected void doClose() {
     this.eventBus.unregister(this);
-  }
-
-  private void doUnparkSuccessor() {
-    lock.lock();
-    try {
-      wait.signalAll();
-    } finally {
-      lock.unlock();
-    }
   }
 
   /**
@@ -431,16 +433,23 @@ final class DistributeDoubleBarrierImp extends DistributeMongoSignalBase<DoubleB
     Next:
     for (; ; ) {
       @SuppressWarnings("unchecked")
-      StatefulVar<Boolean> currState = (StatefulVar<Boolean>) varHandle.getAcquire(this);
-      int currStateHashCode = identityHashCode(currState);
+      StatefulVar<Integer> currEnteredCountState =
+          (StatefulVar<Integer>) enteredCountVarHandle.getAcquire(this);
+      int currEnteredCountStateHashCode = identityHashCode(currEnteredCountState);
+
+      @SuppressWarnings("unchecked")
+      StatefulVar<Integer> currUnenteredCountState =
+          (StatefulVar<Integer>) unenteredCountVarHandle.getAcquire(this);
+      int currUnenteredCountStateHashCode = identityHashCode(currUnenteredCountState);
 
       // 代表删除操作
       Document fullDocument = event.fullDocument();
       if (fullDocument == null) {
         if (identityHashCode(
-                varHandle.compareAndExchangeRelease(this, currState, new StatefulVar<>(false)))
-            == currStateHashCode) {
-          this.doUnparkSuccessor();
+                unenteredCountVarHandle.compareAndExchangeRelease(
+                    this, currUnenteredCountState, new StatefulVar<>(0)))
+            == currUnenteredCountStateHashCode) {
+          unparkSuccessor(lock, leaved, true);
           return;
         }
         Thread.onSpinWait();
@@ -449,11 +458,12 @@ final class DistributeDoubleBarrierImp extends DistributeMongoSignalBase<DoubleB
 
       String phase = fullDocument.getString("phase");
       if (DoubleBarrierPhase.ENTER.name().equals(phase)) {
-        if (fullDocument.getList("partners", Document.class).size() == partnerNum) {
+        if (fullDocument.getList("partners", Document.class).size() == participantCount) {
           if (identityHashCode(
-                  varHandle.compareAndExchangeRelease(this, currState, new StatefulVar<>(false)))
-              == currStateHashCode) {
-            this.doUnparkSuccessor();
+                  enteredCountVarHandle.compareAndExchangeRelease(
+                      this, currEnteredCountState, new StatefulVar<>(participantCount)))
+              == currEnteredCountStateHashCode) {
+            unparkSuccessor(lock, entered, true);
             break Next;
           }
           Thread.onSpinWait();
@@ -463,9 +473,10 @@ final class DistributeDoubleBarrierImp extends DistributeMongoSignalBase<DoubleB
       } else if (DoubleBarrierPhase.LEAVE.name().equals(phase)) {
         if (fullDocument.getList("partners", Document.class).isEmpty()) {
           if (identityHashCode(
-                  varHandle.compareAndExchangeRelease(this, currState, new StatefulVar<>(false)))
-              == currStateHashCode) {
-            this.doUnparkSuccessor();
+                  unenteredCountVarHandle.compareAndExchangeRelease(
+                      this, currUnenteredCountState, new StatefulVar<>(0)))
+              == currUnenteredCountStateHashCode) {
+            unparkSuccessor(lock, leaved, true);
             break Next;
           }
           Thread.onSpinWait();
@@ -477,10 +488,22 @@ final class DistributeDoubleBarrierImp extends DistributeMongoSignalBase<DoubleB
   }
 
   @Override
-  public <P> Collection<P> getPartnerNum() {
-
-
-
-    return null;
+  public Collection<?> getParticipants() {
+    BiFunction<
+            ClientSession,
+            MongoCollection<DoubleBarrierDocument>,
+            List<DoubleBarrierPartnerDocument>>
+        command =
+            (session, coll) -> {
+              var filter = eq("_id", getKey());
+              DoubleBarrierDocument document = coll.find(filter).limit(1).first();
+              return document == null ? Collections.emptyList() : document.partners();
+            };
+    return commandExecutor.loopExecute(
+        command,
+        commandExecutor.defaultDBErrorHandlePolicy(
+            LockBusy, LockFailed, LockTimeout, NoSuchTransaction),
+        null,
+        t -> false);
   }
 }

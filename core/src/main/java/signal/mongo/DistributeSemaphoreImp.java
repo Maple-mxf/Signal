@@ -22,6 +22,8 @@ import static signal.mongo.MongoErrorCode.LockFailed;
 import static signal.mongo.MongoErrorCode.LockTimeout;
 import static signal.mongo.MongoErrorCode.NoSuchTransaction;
 import static signal.mongo.MongoErrorCode.WriteConflict;
+import static signal.mongo.Utils.getCurrentHostname;
+import static signal.mongo.Utils.getCurrentThreadName;
 import static signal.mongo.Utils.parkCurrentThreadUntil;
 
 import com.google.auto.service.AutoService;
@@ -167,9 +169,9 @@ public class DistributeSemaphoreImp extends DistributeMongoSignalBase<SemaphoreD
 
   private SemaphoreOwnerDocument buildCurrentOwner(int permits) {
     return new SemaphoreOwnerDocument(
-        Utils.getCurrentHostname(),
+        getCurrentHostname(),
         this.getLease().getLeaseID(),
-        allowReleaseWithoutAcquire ? "" : Utils.getCurrentThreadName(),
+        allowReleaseWithoutAcquire ? "" : getCurrentThreadName(),
         permits);
   }
 
@@ -184,13 +186,12 @@ public class DistributeSemaphoreImp extends DistributeMongoSignalBase<SemaphoreD
   @Override
   public void acquire(int permits, Long waitTime, TimeUnit timeUnit) throws InterruptedException {
     checkState();
-    checkArgument(
-        permits <= this.permits(),
-        String.format(
-            "The requested permits [%d] exceed the limit [%d].", permits, this.permits()));
+    if (permits > this.permits)
+      throw new IllegalArgumentException(
+          String.format(
+              "The requested permits [%d] exceed the limit [%d].", permits, this.permits()));
 
     SemaphoreOwnerDocument thisOwner = this.buildCurrentOwner(permits);
-
     BiFunction<ClientSession, MongoCollection<SemaphoreDocument>, CommonTxnResponse> command =
         (session, collection) -> {
           @SuppressWarnings("unchecked")
@@ -207,7 +208,8 @@ public class DistributeSemaphoreImp extends DistributeMongoSignalBase<SemaphoreD
             return thrownAnError("Semaphore permits inconsistency.");
 
           // 已占用的permits数量，如果可用数量小于申请的数量，则Blocking当前Thread
-          int occupied = sd.owners().stream().mapToInt(SemaphoreOwnerDocument::acquirePermits).sum();
+          int occupied =
+              sd.owners().stream().mapToInt(SemaphoreOwnerDocument::acquirePermits).sum();
           int available = this.permits() - occupied;
 
           // 当许可的可用数量小于申请的许可数量时，则阻塞当前线程
@@ -487,7 +489,7 @@ public class DistributeSemaphoreImp extends DistributeMongoSignalBase<SemaphoreD
   }
 
   @Override
-  public <P> Collection<P> getPartnerNum() {
+  public Collection<?> getParticipants() {
     BiFunction<ClientSession, MongoCollection<SemaphoreDocument>, List<SemaphoreOwnerDocument>>
         command =
             (session, coll) -> {
@@ -495,12 +497,11 @@ public class DistributeSemaphoreImp extends DistributeMongoSignalBase<SemaphoreD
               SemaphoreDocument document = coll.find(filter).limit(1).first();
               return document == null ? Collections.emptyList() : document.owners();
             };
-    return (Collection<P>)
-        commandExecutor.loopExecute(
-            command,
-            commandExecutor.defaultDBErrorHandlePolicy(
-                LockBusy, LockFailed, LockTimeout, NoSuchTransaction),
-            null,
-            t -> false);
+    return commandExecutor.loopExecute(
+        command,
+        commandExecutor.defaultDBErrorHandlePolicy(
+            LockBusy, LockFailed, LockTimeout, NoSuchTransaction),
+        null,
+        t -> false);
   }
 }

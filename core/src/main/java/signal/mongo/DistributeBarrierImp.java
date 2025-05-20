@@ -220,7 +220,7 @@ public final class DistributeBarrierImp extends DistributeMongoSignalBase<Barrie
   }
 
   @Override
-  public <P> Collection<P> getPartnerNum() {
+  public Collection<?> getParticipants() {
     BiFunction<ClientSession, MongoCollection<BarrierDocument>, List<BarrierWaiterDocument>>
         command =
             (session, coll) -> {
@@ -228,14 +228,12 @@ public final class DistributeBarrierImp extends DistributeMongoSignalBase<Barrie
               BarrierDocument document = coll.find(filter).limit(1).first();
               return document == null ? Collections.emptyList() : document.waiters();
             };
-    List<BarrierWaiterDocument> barrierWaiterDocuments =
-        commandExecutor.loopExecute(
-            command,
-            commandExecutor.defaultDBErrorHandlePolicy(
-                LockBusy, LockFailed, LockTimeout, NoSuchTransaction),
-            null,
-            t -> false);
-    return (Collection<P>) barrierWaiterDocuments;
+    return commandExecutor.loopExecute(
+        command,
+        commandExecutor.defaultDBErrorHandlePolicy(
+            LockBusy, LockFailed, LockTimeout, NoSuchTransaction),
+        null,
+        t -> false);
   }
 
   @DoNotCall

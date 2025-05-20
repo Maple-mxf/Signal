@@ -13,7 +13,9 @@ import static signal.mongo.CollectionNamed.COUNT_DOWN_LATCH_NAMED;
 import static signal.mongo.CommonTxnResponse.ok;
 import static signal.mongo.CommonTxnResponse.retryableError;
 import static signal.mongo.CommonTxnResponse.thrownAnError;
+import static signal.mongo.MongoErrorCode.LockBusy;
 import static signal.mongo.MongoErrorCode.LockFailed;
+import static signal.mongo.MongoErrorCode.LockTimeout;
 import static signal.mongo.MongoErrorCode.NoSuchTransaction;
 import static signal.mongo.MongoErrorCode.WriteConflict;
 import static signal.mongo.Utils.parkCurrentThreadUntil;
@@ -37,6 +39,8 @@ import com.mongodb.client.result.InsertOneResult;
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.VarHandle;
 import java.util.Collection;
+import java.util.Collections;
+import java.util.List;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
@@ -91,8 +95,23 @@ final class DistributeCountDownLatchImp extends DistributeMongoSignalBase<CountD
   private final VarHandle varHandle;
 
   @Override
-  public <P> Collection<P> getPartnerNum() {
-    return null;
+  public Collection<?> getParticipants() {
+    BiFunction<
+            ClientSession,
+            MongoCollection<CountDownLatchDocument>,
+            List<CountDownLatchWaiterDocument>>
+        command =
+            (session, coll) -> {
+              var filter = eq("_id", getKey());
+              CountDownLatchDocument document = coll.find(filter).limit(1).first();
+              return document == null ? Collections.emptyList() : document.waiters();
+            };
+    return commandExecutor.loopExecute(
+        command,
+        commandExecutor.defaultDBErrorHandlePolicy(
+            LockBusy, LockFailed, LockTimeout, NoSuchTransaction),
+        null,
+        t -> false);
   }
 
   private record InitCountDownLatchTxnResponse(
@@ -133,8 +152,7 @@ final class DistributeCountDownLatchImp extends DistributeMongoSignalBase<CountD
                           setOnInsert("version", 1L),
                           addToSet("waiters", thisWaiter)),
                       UPSERT_OPTIONS);
-              if (cdl == null)
-                return new InitCountDownLatchTxnResponse(false, true, false, "", 0);
+              if (cdl == null) return new InitCountDownLatchTxnResponse(false, true, false, "", 0);
               if (cdl.count() != this.count)
                 return new InitCountDownLatchTxnResponse(
                     false,
