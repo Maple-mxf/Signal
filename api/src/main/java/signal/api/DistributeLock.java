@@ -19,8 +19,8 @@ public interface DistributeLock extends DistributeSignal {
   }
 
   /**
-   * @param waitTime 等待事件
-   * @param timeUnit 事件单位
+   * @param waitTime 等待时间
+   * @param timeUnit 时间单位
    * @return 如果超时，则会返回false，否则是true
    * @throws InterruptedException 调用lock操作的线程进入{@link java.lang.Thread.State#TIMED_WAITING}状态，
    *     如果主线程被kill，此时会抛出此异常

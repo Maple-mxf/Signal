@@ -82,10 +82,14 @@ public final class DistributeMutexLockImp extends DistributeMongoSignalBase<Mute
   private final ReentrantLock lock;
   private final Condition available;
 
+  /**
+   * {@link StatefulVar#value}存储的是{@link MutexLockOwnerDocument#hashCode()}， 当{@link
+   * StatefulVar#value} 等于 null时，代表当前未有任何线程获取到锁
+   */
   @Keep
   @GuardedBy("lockOwnerVarHandle")
   @VisibleForTesting
-  StatefulVar<MutexLockOwnerDocument> lockOwner;
+  StatefulVar<Integer> lockOwner;
 
   private final VarHandle lockOwnerVarHandle;
 
@@ -113,6 +117,24 @@ public final class DistributeMutexLockImp extends DistributeMongoSignalBase<Mute
 
   private record TryLockTxnResponse(boolean tryLockSuccess, boolean retryable) {}
 
+  /**
+   * TODO 需要斟酌在TryLock函数内部是否有必要更新lockOwner的值,如果TryLock函数内部会更新LockOwner的值，
+   * TODO 则可能会带来mutex的enterCount字段的无限自增，在事物成功的情况但是变量更新失败的情况下会带来这个问题
+   *
+   * <p>{@link DistributeMutexLockImp#lockOwner} == null,其他线程已经得到了锁，但未接受到ChangeStream事件
+   *
+   * <p>第一种情况：tryLock 先更新了{@link DistributeMutexLockImp#lockOwner}的值，lockOwner != null, 线程成功挂起
+   *
+   * <p>第二种情况：{@link
+   * DistributeMutexLockImp#awakeHead(ChangeStreamEvents.MutexLockChangeAndRemoveEvent)} 先更新了{@link
+   * DistributeMutexLockImp#lockOwner} 的值，lockOwner != null, TryLock的线程更新{@link
+   * DistributeMutexLockImp#lockOwner}失败，重新进入TryLock进程
+   *
+   * @param waitTime 等待时间
+   * @param timeUnit 时间单位
+   * @return 是否得到锁
+   * @throws InterruptedException
+   */
   @CheckReturnValue
   @Override
   public boolean tryLock(Long waitTime, TimeUnit timeUnit) throws InterruptedException {
@@ -167,10 +189,10 @@ public final class DistributeMutexLockImp extends DistributeMongoSignalBase<Mute
               available,
               () -> {
                 @SuppressWarnings("unchecked")
-                StatefulVar<MutexLockOwnerDocument> sv =
-                    (StatefulVar<MutexLockOwnerDocument>) lockOwnerVarHandle.getAcquire(this);
+                StatefulVar<Integer> sv =
+                    (StatefulVar<Integer>) lockOwnerVarHandle.getAcquire(this);
                 if (sv.value == null) return false;
-                return !sv.value.equals(thisOwner);
+                return !sv.value.equals(thisOwner.hashCode());
               },
               timed,
               s,
@@ -188,7 +210,10 @@ public final class DistributeMutexLockImp extends DistributeMongoSignalBase<Mute
               timed ? (waitTimeNanos - (nanoTime() - s)) : -1L,
               NANOSECONDS);
       if (rsp.tryLockSuccess) return true;
-      if (rsp.retryable) continue Next;
+      if (rsp.retryable) {
+        Thread.onSpinWait();
+        continue Next;
+      }
     }
   }
 
@@ -294,15 +319,15 @@ public final class DistributeMutexLockImp extends DistributeMongoSignalBase<Mute
     Next:
     for (; ; ) {
       @SuppressWarnings("unchecked")
-      StatefulVar<MutexLockOwnerDocument> currLockOwnerState =
-          (StatefulVar<MutexLockOwnerDocument>) lockOwnerVarHandle.getAcquire(this);
+      StatefulVar<Integer> currLockOwnerState =
+          (StatefulVar<Integer>) lockOwnerVarHandle.getAcquire(this);
       int currLockOwnerStateHashCode = identityHashCode(currLockOwnerState);
 
       Document fullDocument = event.fullDocument();
       if (fullDocument == null) {
         if (identityHashCode(
                 lockOwnerVarHandle.compareAndExchangeRelease(
-                    this, currLockOwnerState, new StatefulVar<MutexLockOwnerDocument>(null)))
+                    this, currLockOwnerState, new StatefulVar<Integer>(null)))
             == currLockOwnerStateHashCode) {
           unparkSuccessor(lock, available, false);
           return;
@@ -310,17 +335,17 @@ public final class DistributeMutexLockImp extends DistributeMongoSignalBase<Mute
         Thread.onSpinWait();
         continue Next;
       }
-
-      MutexLockOwnerDocument thatOwner =
+      Integer thatOwnerHashCode =
           ofNullable(fullDocument.get("owner", Document.class))
               .map(
                   t ->
                       new MutexLockOwnerDocument(
                           t.getString("hostname"), t.getString("lease"), t.getString("thread"), 0))
+              .map(MutexLockOwnerDocument::hashCode)
               .orElse(null);
       if (identityHashCode(
               lockOwnerVarHandle.compareAndExchangeRelease(
-                  this, currLockOwnerState, new StatefulVar<>(thatOwner)))
+                  this, currLockOwnerState, new StatefulVar<>(thatOwnerHashCode)))
           == currLockOwnerStateHashCode) {
         unparkSuccessor(lock, available, false);
         return;
