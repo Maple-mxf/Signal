@@ -17,9 +17,9 @@ import static signal.mongo.CollectionNamed.MUTEX_LOCK_NAMED;
 import static signal.mongo.CommonTxnResponse.ok;
 import static signal.mongo.CommonTxnResponse.retryableError;
 import static signal.mongo.CommonTxnResponse.thrownAnError;
-import static signal.mongo.MongoErrorCode.DuplicateKey;
-import static signal.mongo.MongoErrorCode.NoSuchTransaction;
-import static signal.mongo.MongoErrorCode.WriteConflict;
+import static signal.mongo.MongoErrorCode.DUPLICATE_KEY;
+import static signal.mongo.MongoErrorCode.NO_SUCH_TRANSACTION;
+import static signal.mongo.MongoErrorCode.WRITE_CONFLICT;
 import static signal.mongo.Utils.getCurrentHostname;
 import static signal.mongo.Utils.getCurrentThreadName;
 import static signal.mongo.Utils.parkCurrentThreadUntil;
@@ -67,7 +67,6 @@ import signal.mongo.pojo.MutexLockOwnerDocument;
  *        hostname: 'E4981F',
  *        thread: Long('27'),
  *        lease: '04125035701132000',
- *        state: Long('1')
  *      }
  *    ]
  *  }
@@ -107,9 +106,9 @@ public final class DistributeMutexLockImp extends DistributeMongoSignalBase<Mute
     this.eventBus.register(this);
   }
 
-  private MutexLockOwnerDocument buildCurrentOwner() {
+  private MutexLockOwnerDocument buildCurrentOwner(int enterCount) {
     return new MutexLockOwnerDocument(
-        getCurrentHostname(), lease.getLeaseID(), getCurrentThreadName());
+        getCurrentHostname(), lease.getLeaseID(), getCurrentThreadName(), enterCount);
   }
 
   private record TryLockTxnResponse(boolean tryLockSuccess, boolean retryable) {}
@@ -117,26 +116,31 @@ public final class DistributeMutexLockImp extends DistributeMongoSignalBase<Mute
   @CheckReturnValue
   @Override
   public boolean tryLock(Long waitTime, TimeUnit timeUnit) throws InterruptedException {
-    MutexLockOwnerDocument thisOwner = buildCurrentOwner();
+    MutexLockOwnerDocument thisOwner = buildCurrentOwner(1);
     BiFunction<ClientSession, MongoCollection<MutexLockDocument>, TryLockTxnResponse> command =
         (session, coll) -> {
           MutexLockDocument mutex = coll.find(session, eq("_id", this.getKey())).first();
           if (mutex == null) {
             mutex = new MutexLockDocument(key, thisOwner, 1L);
             InsertOneResult insertOneResult = coll.insertOne(session, mutex);
-            boolean success = insertOneResult.getInsertedId() != null;
-            if (!success) return new TryLockTxnResponse(false, true);
-            return new TryLockTxnResponse(true, false);
+            boolean success =
+                insertOneResult.wasAcknowledged() && insertOneResult.getInsertedId() != null;
+            return new TryLockTxnResponse(success, !success);
           }
 
           long version = mutex.version(), newVersion = version + 1;
 
           // 其他线程占用锁资源 挂起当前线程, 判断是否属于当前线程
           if (mutex.owner() != null) {
-            if (mutex.owner().equals(thisOwner)) {
-              return new TryLockTxnResponse(true, false);
-            }
-            return new TryLockTxnResponse(false, false);
+            if (!mutex.owner().equals(thisOwner)) return new TryLockTxnResponse(false, false);
+            mutex =
+                coll.findOneAndUpdate(
+                    session,
+                    and(eq("_id", key), eq("version", version)),
+                    combine(inc("version", 1L), inc("owner.enter_count", 1)),
+                    UPDATE_OPTIONS);
+            boolean success = mutex != null && mutex.version() == newVersion;
+            return new TryLockTxnResponse(success, !success);
           }
           mutex =
               coll.findOneAndUpdate(
@@ -146,8 +150,7 @@ public final class DistributeMutexLockImp extends DistributeMongoSignalBase<Mute
                   UPDATE_OPTIONS);
           boolean success =
               (mutex != null && mutex.version() == newVersion && thisOwner.equals(mutex.owner()));
-          if (!success) return new TryLockTxnResponse(false, true);
-          return new TryLockTxnResponse(true, false);
+          return new TryLockTxnResponse(success, !success);
         };
 
     long s = nanoTime(), waitTimeNanos = timeUnit.toNanos(waitTime);
@@ -178,7 +181,7 @@ public final class DistributeMutexLockImp extends DistributeMongoSignalBase<Mute
           commandExecutor.loopExecute(
               command,
               commandExecutor.defaultDBErrorHandlePolicy(
-                  WriteConflict, DuplicateKey, NoSuchTransaction),
+                  WRITE_CONFLICT, DUPLICATE_KEY, NO_SUCH_TRANSACTION),
               null,
               t -> t.retryable,
               timed,
@@ -191,17 +194,29 @@ public final class DistributeMutexLockImp extends DistributeMongoSignalBase<Mute
 
   @Override
   public void unlock() {
-    MutexLockOwnerDocument thisOwner = buildCurrentOwner();
+    MutexLockOwnerDocument thisOwner = buildCurrentOwner(1);
     BiFunction<ClientSession, MongoCollection<MutexLockDocument>, CommonTxnResponse> command =
         (session, coll) -> {
           MutexLockDocument mutex = coll.find(session, eq("_id", key)).first();
           if (mutex == null || mutex.owner() == null || !mutex.owner().equals(thisOwner))
             return thrownAnError("The current instance does not hold a mutex lock.");
-          DeleteResult deleteResult =
-              coll.deleteOne(session, and(eq("_id", key), eq("version", mutex.version())));
-          return deleteResult.wasAcknowledged() && deleteResult.getDeletedCount() == 1L
-              ? ok()
-              : retryableError();
+
+          MutexLockOwnerDocument thatOwner = mutex.owner();
+          if (thatOwner.enterCount() <= 1) {
+            DeleteResult deleteResult =
+                coll.deleteOne(session, and(eq("_id", key), eq("version", mutex.version())));
+            return deleteResult.wasAcknowledged() && deleteResult.getDeletedCount() == 1L
+                ? ok()
+                : retryableError();
+          }
+          long version = mutex.version(), newVersion = version + 1L;
+          mutex =
+              coll.findOneAndUpdate(
+                  session,
+                  and(eq("_id", key), eq("version", version)),
+                  combine(inc("version", 1L), inc("owner.enter_count", -1)),
+                  UPDATE_OPTIONS);
+          return (mutex != null && mutex.version() == newVersion) ? ok() : retryableError();
         };
 
     Next:
@@ -210,7 +225,7 @@ public final class DistributeMutexLockImp extends DistributeMongoSignalBase<Mute
       CommonTxnResponse rsp =
           commandExecutor.loopExecute(
               command,
-              commandExecutor.defaultDBErrorHandlePolicy(NoSuchTransaction, WriteConflict),
+              commandExecutor.defaultDBErrorHandlePolicy(NO_SUCH_TRANSACTION, WRITE_CONFLICT),
               null,
               t -> !t.txnOk && t.retryable && !t.thrownError);
       if (rsp.thrownError) throw new SignalException(rsp.message);
@@ -229,13 +244,13 @@ public final class DistributeMutexLockImp extends DistributeMongoSignalBase<Mute
         (session, coll) ->
             coll.countDocuments(session, and(eq("_id", this.getKey()), exists("owner", true))) > 0L;
     return commandExecutor.loopExecute(
-        command, commandExecutor.defaultDBErrorHandlePolicy(NoSuchTransaction));
+        command, commandExecutor.defaultDBErrorHandlePolicy(NO_SUCH_TRANSACTION));
   }
 
   @Override
   public boolean isHeldByCurrentThread() {
     checkState();
-    MutexLockOwnerDocument thisOwner = buildCurrentOwner();
+    MutexLockOwnerDocument thisOwner = buildCurrentOwner(1);
     BiFunction<ClientSession, MongoCollection<MutexLockDocument>, Boolean> command =
         (session, coll) ->
             coll.countDocuments(
@@ -247,7 +262,7 @@ public final class DistributeMutexLockImp extends DistributeMongoSignalBase<Mute
                         eq("owner.thread", thisOwner.thread())))
                 > 0L;
     return commandExecutor.loopExecute(
-        command, commandExecutor.defaultDBErrorHandlePolicy(NoSuchTransaction));
+        command, commandExecutor.defaultDBErrorHandlePolicy(NO_SUCH_TRANSACTION));
   }
 
   @Override
@@ -262,7 +277,7 @@ public final class DistributeMutexLockImp extends DistributeMongoSignalBase<Mute
           return mutex == null ? null : mutex.owner();
         };
     return commandExecutor.loopExecute(
-        command, commandExecutor.defaultDBErrorHandlePolicy(NoSuchTransaction));
+        command, commandExecutor.defaultDBErrorHandlePolicy(NO_SUCH_TRANSACTION));
   }
 
   @Override
@@ -301,7 +316,7 @@ public final class DistributeMutexLockImp extends DistributeMongoSignalBase<Mute
               .map(
                   t ->
                       new MutexLockOwnerDocument(
-                          t.getString("hostname"), t.getString("lease"), t.getString("thread")))
+                          t.getString("hostname"), t.getString("lease"), t.getString("thread"), 0))
               .orElse(null);
       if (identityHashCode(
               lockOwnerVarHandle.compareAndExchangeRelease(
@@ -335,7 +350,7 @@ public final class DistributeMutexLockImp extends DistributeMongoSignalBase<Mute
       CommonTxnResponse rsp =
           commandExecutor.loopExecute(
               command,
-              commandExecutor.defaultDBErrorHandlePolicy(NoSuchTransaction, WriteConflict),
+              commandExecutor.defaultDBErrorHandlePolicy(NO_SUCH_TRANSACTION, WRITE_CONFLICT),
               null,
               t -> !t.txnOk && t.retryable);
       if (rsp.txnOk) break Next;

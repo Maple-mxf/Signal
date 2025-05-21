@@ -9,11 +9,11 @@ import static com.mongodb.client.model.Updates.setOnInsert;
 import static java.lang.System.identityHashCode;
 import static java.lang.System.nanoTime;
 import static signal.mongo.CollectionNamed.BARRIER_NAMED;
-import static signal.mongo.MongoErrorCode.LockBusy;
-import static signal.mongo.MongoErrorCode.LockFailed;
-import static signal.mongo.MongoErrorCode.LockTimeout;
-import static signal.mongo.MongoErrorCode.NoSuchTransaction;
-import static signal.mongo.MongoErrorCode.WriteConflict;
+import static signal.mongo.MongoErrorCode.LOCK_BUSY;
+import static signal.mongo.MongoErrorCode.LOCK_FAILED;
+import static signal.mongo.MongoErrorCode.LOCK_TIMEOUT;
+import static signal.mongo.MongoErrorCode.NO_SUCH_TRANSACTION;
+import static signal.mongo.MongoErrorCode.WRITE_CONFLICT;
 import static signal.mongo.Utils.parkCurrentThreadUntil;
 
 import com.google.auto.service.AutoService;
@@ -108,7 +108,7 @@ public final class DistributeBarrierImp extends DistributeMongoSignalBase<Barrie
     for (; ; ) {
       if (commandExecutor.loopExecute(
           command,
-          commandExecutor.defaultDBErrorHandlePolicy(WriteConflict, NoSuchTransaction),
+          commandExecutor.defaultDBErrorHandlePolicy(WRITE_CONFLICT, NO_SUCH_TRANSACTION),
           null,
           t -> !t)) break;
     }
@@ -155,7 +155,7 @@ public final class DistributeBarrierImp extends DistributeMongoSignalBase<Barrie
     for (; ; ) {
       if (commandExecutor.loopExecute(
           command,
-          commandExecutor.defaultDBErrorHandlePolicy(WriteConflict, NoSuchTransaction),
+          commandExecutor.defaultDBErrorHandlePolicy(WRITE_CONFLICT, NO_SUCH_TRANSACTION),
           null,
           t -> !t)) break;
     }
@@ -197,7 +197,7 @@ public final class DistributeBarrierImp extends DistributeMongoSignalBase<Barrie
     for (; ; ) {
       if (commandExecutor.loopExecute(
           command,
-          commandExecutor.defaultDBErrorHandlePolicy(WriteConflict, NoSuchTransaction),
+          commandExecutor.defaultDBErrorHandlePolicy(WRITE_CONFLICT, NO_SUCH_TRANSACTION),
           null,
           t -> !t)) break;
     }
@@ -214,7 +214,7 @@ public final class DistributeBarrierImp extends DistributeMongoSignalBase<Barrie
     return commandExecutor.loopExecute(
         command,
         commandExecutor.defaultDBErrorHandlePolicy(
-            LockBusy, LockFailed, LockTimeout, NoSuchTransaction),
+                LOCK_BUSY, LOCK_FAILED, LOCK_TIMEOUT, NO_SUCH_TRANSACTION),
         null,
         t -> false);
   }
@@ -231,7 +231,7 @@ public final class DistributeBarrierImp extends DistributeMongoSignalBase<Barrie
     return commandExecutor.loopExecute(
         command,
         commandExecutor.defaultDBErrorHandlePolicy(
-            LockBusy, LockFailed, LockTimeout, NoSuchTransaction),
+                LOCK_BUSY, LOCK_FAILED, LOCK_TIMEOUT, NO_SUCH_TRANSACTION),
         null,
         t -> false);
   }

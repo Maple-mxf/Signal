@@ -14,15 +14,17 @@ import static java.lang.System.identityHashCode;
 import static java.lang.System.nanoTime;
 import static java.util.concurrent.TimeUnit.NANOSECONDS;
 import static signal.mongo.CollectionNamed.READ_WRITE_LOCK_NAMED;
-import static signal.mongo.MongoErrorCode.DuplicateKey;
-import static signal.mongo.MongoErrorCode.LockFailed;
-import static signal.mongo.MongoErrorCode.NoSuchTransaction;
-import static signal.mongo.MongoErrorCode.TransactionExceededLifetimeLimitSeconds;
-import static signal.mongo.MongoErrorCode.WriteConflict;
+import static signal.mongo.MongoErrorCode.DUPLICATE_KEY;
+import static signal.mongo.MongoErrorCode.LOCK_FAILED;
+import static signal.mongo.MongoErrorCode.NO_SUCH_TRANSACTION;
+import static signal.mongo.MongoErrorCode.TRANSACTION_EXCEEDED_LIFETIME_LIMIT_SECONDS;
+import static signal.mongo.MongoErrorCode.WRITE_CONFLICT;
 import static signal.mongo.CommonTxnResponse.ok;
 import static signal.mongo.CommonTxnResponse.parkThread;
 import static signal.mongo.CommonTxnResponse.retryableError;
 import static signal.mongo.CommonTxnResponse.thrownAnError;
+import static signal.mongo.Utils.getCurrentHostname;
+import static signal.mongo.Utils.getCurrentThreadName;
 import static signal.mongo.Utils.mappedHolder2AndFilter;
 import static signal.mongo.Utils.parkCurrentThreadUntil;
 
@@ -45,6 +47,7 @@ import com.mongodb.client.result.InsertOneResult;
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.VarHandle;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.TimeUnit;
@@ -59,6 +62,9 @@ import signal.api.DistributeReadWriteLock;
 import signal.api.Holder;
 import signal.api.Lease;
 import signal.api.SignalException;
+import signal.mongo.pojo.RWLockDocument;
+import signal.mongo.pojo.RWLockMode;
+import signal.mongo.pojo.RWLockOwnerDocument;
 
 /**
  * 数据存储格式
@@ -81,7 +87,7 @@ import signal.api.SignalException;
  * <p>锁的公平性：非公平锁
  */
 @AutoService({DistributeReadWriteLock.class})
-public final class DistributeReadWriteLockImp extends DistributeMongoSignalBase
+public final class DistributeReadWriteLockImp extends DistributeMongoSignalBase<RWLockDocument>
     implements DistributeReadWriteLock {
 
   // TODO 锁的可重入性
@@ -186,9 +192,14 @@ public final class DistributeReadWriteLockImp extends DistributeMongoSignalBase
     forceUnlock();
   }
 
+  private RWLockOwnerDocument buildCurrentOwner() {
+    return new RWLockOwnerDocument(
+        getCurrentHostname(), lease.getLeaseID(), getCurrentThreadName());
+  }
+
   @ThreadSafe
   @AutoService(DistributeWriteLock.class)
-  private class DistributeWriteLockImp extends DistributeMongoSignalBase
+  private class DistributeWriteLockImp extends DistributeMongoSignalBase<RWLockDocument>
       implements DistributeWriteLock {
 
     public DistributeWriteLockImp(
@@ -199,31 +210,25 @@ public final class DistributeReadWriteLockImp extends DistributeMongoSignalBase
     @CheckReturnValue
     @Override
     public boolean tryLock(Long waitTime, TimeUnit timeUnit) throws InterruptedException {
-      Document holder = currHolder();
+      RWLockOwnerDocument thisOwner = buildCurrentOwner();
 
-      BiFunction<ClientSession, MongoCollection<Document>, CommonTxnResponse> command =
+      BiFunction<ClientSession, MongoCollection<RWLockDocument>, CommonTxnResponse> command =
           (session, coll) -> {
 
             // 执行之前先获取state的值，避免和wakeHead函数并发更新state的值冲突
-            StatefulVar<String> currState =
-                (StatefulVar<String>) varHandle.getAcquire(DistributeWriteLockImp.this);
-
-            Document writeLock = coll.find(session, eq("_id", this.getKey())).first();
+            RWLockDocument writeLock = coll.find(session, eq("_id", this.getKey())).first();
             if (writeLock == null) {
-              InsertOneResult insertOneResult =
-                  coll.insertOne(
-                      session,
-                      new Document("_id", this.getKey())
-                          .append("m", WRITE_MODE)
-                          .append("v", 1L)
-                          .append("o", ImmutableList.of(holder)));
+              writeLock =
+                  new RWLockDocument(
+                      key, RWLockMode.WRITE, Collections.singletonList(thisOwner), 1L);
+              InsertOneResult insertOneResult = coll.insertOne(session, writeLock);
               return insertOneResult.getInsertedId() != null ? ok() : retryableError();
             }
-            List<Document> holders = writeLock.getList("o", Document.class);
-            boolean inReadMode = READ_MODE.equals(writeLock.getString("m"));
-            boolean holdersEmpty = holders == null || holders.isEmpty();
+            List<RWLockOwnerDocument> owners = writeLock.owners();
+            boolean inReadMode = RWLockMode.READ.equals(writeLock.mode());
+            boolean ownersEmpty = owners == null || owners.isEmpty();
 
-            if (inReadMode && !holdersEmpty) {
+            if (inReadMode && !ownersEmpty) {
               // 设置当前锁的状态处于r状态
               if (identityHashCode(currState)
                   == identityHashCode(
@@ -276,11 +281,11 @@ public final class DistributeReadWriteLockImp extends DistributeMongoSignalBase
             commandExecutor.loopExecute(
                 command,
                 commandExecutor.defaultDBErrorHandlePolicy(
-                    NoSuchTransaction,
-                    WriteConflict,
-                    LockFailed,
-                    TransactionExceededLifetimeLimitSeconds,
-                    DuplicateKey),
+                        NO_SUCH_TRANSACTION,
+                        WRITE_CONFLICT,
+                        LOCK_FAILED,
+                        TRANSACTION_EXCEEDED_LIFETIME_LIMIT_SECONDS,
+                        DUPLICATE_KEY),
                 null,
                 t -> !t.txnOk && t.retryable && !t.thrownError && !t.parkThread,
                 timed,
@@ -337,7 +342,7 @@ public final class DistributeReadWriteLockImp extends DistributeMongoSignalBase
           commandExecutor.loopExecute(
               command,
               commandExecutor.defaultDBErrorHandlePolicy(
-                  NoSuchTransaction, WriteConflict, LockFailed),
+                      NO_SUCH_TRANSACTION, WRITE_CONFLICT, LOCK_FAILED),
               null,
               t -> false);
       if (txnResponse.thrownError) throw new SignalException(txnResponse.message);
@@ -360,11 +365,17 @@ public final class DistributeReadWriteLockImp extends DistributeMongoSignalBase
 
     @Override
     protected void doClose() {}
+
+    @Override
+    public Object getOwner() {
+      return null;
+    }
   }
 
   @ThreadSafe
   @AutoService(DistributeReadLock.class)
-  class DistributeReadLockImp extends DistributeMongoSignalBase implements DistributeReadLock {
+  class DistributeReadLockImp extends DistributeMongoSignalBase<RWLockDocument>
+      implements DistributeReadLock {
 
     DistributeReadLockImp(Lease lease, String key, MongoClient mongoClient, MongoDatabase db) {
       super(lease, key, mongoClient, db, READ_WRITE_LOCK_NAMED);
@@ -444,7 +455,8 @@ public final class DistributeReadWriteLockImp extends DistributeMongoSignalBase
                 () -> {
                   @SuppressWarnings("UnnecessaryParentheses")
                   StatefulVar<String> sv =
-                      ((StatefulVar<String>) (varHandle.getAcquire(DistributeReadWriteLockImp.this)));
+                      ((StatefulVar<String>)
+                          (varHandle.getAcquire(DistributeReadWriteLockImp.this)));
                   return sv == null || sv.value.isEmpty() || "r".equals(sv.value);
                 },
                 timed,
@@ -460,7 +472,7 @@ public final class DistributeReadWriteLockImp extends DistributeMongoSignalBase
             commandExecutor.loopExecute(
                 command,
                 commandExecutor.defaultDBErrorHandlePolicy(
-                    NoSuchTransaction, WriteConflict, LockFailed, DuplicateKey),
+                        NO_SUCH_TRANSACTION, WRITE_CONFLICT, LOCK_FAILED, DUPLICATE_KEY),
                 null,
                 t -> !t.txnOk && t.retryable && !t.thrownError && !t.parkThread,
                 timed,
@@ -529,7 +541,7 @@ public final class DistributeReadWriteLockImp extends DistributeMongoSignalBase
           commandExecutor.loopExecute(
               command,
               commandExecutor.defaultDBErrorHandlePolicy(
-                  NoSuchTransaction, WriteConflict, LockFailed),
+                      NO_SUCH_TRANSACTION, WRITE_CONFLICT, LOCK_FAILED),
               null,
               t -> false);
 
@@ -603,7 +615,7 @@ public final class DistributeReadWriteLockImp extends DistributeMongoSignalBase
         commandExecutor.loopExecute(
             command,
             commandExecutor.defaultDBErrorHandlePolicy(
-                NoSuchTransaction, WriteConflict, LockFailed),
+                    NO_SUCH_TRANSACTION, WRITE_CONFLICT, LOCK_FAILED),
             null,
             t -> !t.txnOk && t.retryable);
 

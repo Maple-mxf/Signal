@@ -13,12 +13,12 @@ import static signal.mongo.CollectionNamed.DOUBLE_BARRIER_NAMED;
 import static signal.mongo.CommonTxnResponse.ok;
 import static signal.mongo.CommonTxnResponse.retryableError;
 import static signal.mongo.CommonTxnResponse.thrownAnError;
-import static signal.mongo.MongoErrorCode.DuplicateKey;
-import static signal.mongo.MongoErrorCode.LockBusy;
-import static signal.mongo.MongoErrorCode.LockFailed;
-import static signal.mongo.MongoErrorCode.LockTimeout;
-import static signal.mongo.MongoErrorCode.NoSuchTransaction;
-import static signal.mongo.MongoErrorCode.WriteConflict;
+import static signal.mongo.MongoErrorCode.DUPLICATE_KEY;
+import static signal.mongo.MongoErrorCode.LOCK_BUSY;
+import static signal.mongo.MongoErrorCode.LOCK_FAILED;
+import static signal.mongo.MongoErrorCode.LOCK_TIMEOUT;
+import static signal.mongo.MongoErrorCode.NO_SUCH_TRANSACTION;
+import static signal.mongo.MongoErrorCode.WRITE_CONFLICT;
 import static signal.mongo.Utils.parkCurrentThreadUntil;
 import static signal.mongo.Utils.unparkSuccessor;
 
@@ -166,7 +166,7 @@ final class DistributeDoubleBarrierImp extends DistributeMongoSignalBase<DoubleB
           commandExecutor.loopExecute(
               command,
               commandExecutor.defaultDBErrorHandlePolicy(
-                  NoSuchTransaction, WriteConflict, DuplicateKey),
+                      NO_SUCH_TRANSACTION, WRITE_CONFLICT, DUPLICATE_KEY),
               null,
               t -> !t.txnOk && t.retryable && !t.thrownError);
       if (rsp.thrownError) throw new SignalException(rsp.message);
@@ -289,7 +289,7 @@ final class DistributeDoubleBarrierImp extends DistributeMongoSignalBase<DoubleB
           commandExecutor.loopExecute(
               command,
               commandExecutor.defaultDBErrorHandlePolicy(
-                  NoSuchTransaction, WriteConflict, DuplicateKey),
+                      NO_SUCH_TRANSACTION, WRITE_CONFLICT, DUPLICATE_KEY),
               null,
               t -> !t.txnOk && t.retryable && !t.thrownError);
       if (rsp.thrownError) throw new SignalException(rsp.message);
@@ -391,7 +391,7 @@ final class DistributeDoubleBarrierImp extends DistributeMongoSignalBase<DoubleB
       CommonTxnResponse rsp =
           commandExecutor.loopExecute(
               command,
-              commandExecutor.defaultDBErrorHandlePolicy(NoSuchTransaction, WriteConflict),
+              commandExecutor.defaultDBErrorHandlePolicy(NO_SUCH_TRANSACTION, WRITE_CONFLICT),
               null,
               t -> !t.txnOk && t.retryable && !t.thrownError);
       if (rsp.thrownError) throw new SignalException(rsp.message);
@@ -502,7 +502,7 @@ final class DistributeDoubleBarrierImp extends DistributeMongoSignalBase<DoubleB
     return commandExecutor.loopExecute(
         command,
         commandExecutor.defaultDBErrorHandlePolicy(
-            LockBusy, LockFailed, LockTimeout, NoSuchTransaction),
+                LOCK_BUSY, LOCK_FAILED, LOCK_TIMEOUT, NO_SUCH_TRANSACTION),
         null,
         t -> false);
   }

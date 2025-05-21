@@ -16,12 +16,12 @@ import static signal.mongo.CollectionNamed.SEMAPHORE_NAMED;
 import static signal.mongo.CommonTxnResponse.ok;
 import static signal.mongo.CommonTxnResponse.retryableError;
 import static signal.mongo.CommonTxnResponse.thrownAnError;
-import static signal.mongo.MongoErrorCode.DuplicateKey;
-import static signal.mongo.MongoErrorCode.LockBusy;
-import static signal.mongo.MongoErrorCode.LockFailed;
-import static signal.mongo.MongoErrorCode.LockTimeout;
-import static signal.mongo.MongoErrorCode.NoSuchTransaction;
-import static signal.mongo.MongoErrorCode.WriteConflict;
+import static signal.mongo.MongoErrorCode.DUPLICATE_KEY;
+import static signal.mongo.MongoErrorCode.LOCK_BUSY;
+import static signal.mongo.MongoErrorCode.LOCK_FAILED;
+import static signal.mongo.MongoErrorCode.LOCK_TIMEOUT;
+import static signal.mongo.MongoErrorCode.NO_SUCH_TRANSACTION;
+import static signal.mongo.MongoErrorCode.WRITE_CONFLICT;
 import static signal.mongo.Utils.getCurrentHostname;
 import static signal.mongo.Utils.getCurrentThreadName;
 import static signal.mongo.Utils.parkCurrentThreadUntil;
@@ -282,7 +282,7 @@ public class DistributeSemaphoreImp extends DistributeMongoSignalBase<SemaphoreD
           commandExecutor.loopExecute(
               command,
               commandExecutor.defaultDBErrorHandlePolicy(
-                  NoSuchTransaction, DuplicateKey, LockFailed),
+                      NO_SUCH_TRANSACTION, DUPLICATE_KEY, LOCK_FAILED),
               null,
               t -> !t.txnOk && t.retryable && !t.thrownError,
               timed,
@@ -374,7 +374,7 @@ public class DistributeSemaphoreImp extends DistributeMongoSignalBase<SemaphoreD
     CommonTxnResponse rsp =
         commandExecutor.loopExecute(
             command,
-            commandExecutor.defaultDBErrorHandlePolicy(NoSuchTransaction, WriteConflict),
+            commandExecutor.defaultDBErrorHandlePolicy(NO_SUCH_TRANSACTION, WRITE_CONFLICT),
             null,
             resRetryablePolicy);
 
@@ -410,7 +410,7 @@ public class DistributeSemaphoreImp extends DistributeMongoSignalBase<SemaphoreD
     for (; ; ) {
       if (commandExecutor.loopExecute(
           command,
-          commandExecutor.defaultDBErrorHandlePolicy(NoSuchTransaction, WriteConflict),
+          commandExecutor.defaultDBErrorHandlePolicy(NO_SUCH_TRANSACTION, WRITE_CONFLICT),
           null,
           t -> !t)) break;
     }
@@ -500,7 +500,7 @@ public class DistributeSemaphoreImp extends DistributeMongoSignalBase<SemaphoreD
     return commandExecutor.loopExecute(
         command,
         commandExecutor.defaultDBErrorHandlePolicy(
-            LockBusy, LockFailed, LockTimeout, NoSuchTransaction),
+                LOCK_BUSY, LOCK_FAILED, LOCK_TIMEOUT, NO_SUCH_TRANSACTION),
         null,
         t -> false);
   }

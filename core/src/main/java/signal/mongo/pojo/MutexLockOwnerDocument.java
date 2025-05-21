@@ -7,7 +7,8 @@ import java.util.Objects;
 public record MutexLockOwnerDocument(
     @BsonProperty("hostname") String hostname,
     @BsonProperty("lease") String lease,
-    @BsonProperty("thread") String thread) {
+    @BsonProperty("thread") String thread,
+    @BsonProperty("enter_count") int enterCount) {
 
   @Override
   public boolean equals(Object o) {
