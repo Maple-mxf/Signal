@@ -7,7 +7,8 @@ import java.util.Objects;
 public record RWLockOwnerDocument(
     @BsonProperty("hostname") String hostname,
     @BsonProperty("lease") String lease,
-    @BsonProperty("thread") String thread) {
+    @BsonProperty("thread") String thread,
+    @BsonProperty("enter_count") Integer enterCount) {
   @Override
   public boolean equals(Object o) {
     if (this == o) return true;
