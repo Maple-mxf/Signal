@@ -27,7 +27,7 @@ final class LeaseImp extends Lease {
   private final MongoClient client;
   private final MongoDatabase db;
   private final MongoCollection<Document> collection;
-  private final Map<String, DistributeMongoSignalBase> signalList = new HashMap<>(4);
+  private final Map<String, DistributeMongoSignalBase<?>> signalList = new HashMap<>(4);
   private final EventBus leaseScopedEventBus;
 
   private boolean revoked = false;
@@ -131,8 +131,8 @@ final class LeaseImp extends Lease {
                     this, key, client, db, participants, leaseScopedEventBus));
   }
 
-  private void checkTypesafe(String key, Class<? extends DistributeMongoSignalBase> type) {
-    DistributeMongoSignalBase signal = signalList.get(key);
+  private void checkTypesafe(String key, Class<? extends DistributeMongoSignalBase<?>> type) {
+    DistributeMongoSignalBase<?> signal = signalList.get(key);
     if (signal == null) return;
     if (!signal.getClass().equals(type))
       throw new UnsupportedOperationException(
