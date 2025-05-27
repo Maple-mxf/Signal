@@ -119,7 +119,8 @@ public final class DistributeReadWriteLockImp extends DistributeMongoSignalBase<
   private final EventBus eventBus;
 
   private final ReentrantLock lock;
-  private final Condition available;
+  private final Condition writeLockAvailable;
+  private final Condition readLockAvailable;
 
   DistributeReadWriteLockImp(
       Lease lease, String key, MongoClient mongoClient, MongoDatabase db, EventBus eventBus) {
@@ -129,14 +130,15 @@ public final class DistributeReadWriteLockImp extends DistributeMongoSignalBase<
     try {
       modeVarHandle =
           MethodHandles.lookup()
-              .findVarHandle(DistributeReadWriteLockImp.class, "mode", StatefulVar.class);
+              .findVarHandle(DistributeReadWriteLockImp.class, "state", StatefulVar.class);
     } catch (NoSuchFieldException | IllegalAccessException e) {
       throw new IllegalStateException(e);
     }
 
     this.eventBus = eventBus;
     this.lock = new ReentrantLock();
-    this.available = lock.newCondition();
+    this.writeLockAvailable = lock.newCondition();
+    this.readLockAvailable = lock.newCondition();
 
     this.eventBus.register(this);
     this.readLockImp = new DistributeReadLockImp(lease, key, mongoClient, db);
@@ -169,13 +171,12 @@ public final class DistributeReadWriteLockImp extends DistributeMongoSignalBase<
     eventBus.unregister(this);
     readLockImp.close();
     writeLockImp.close();
-    unparkSuccessor(lock, available, true);
+    unparkSuccessor(lock, writeLockAvailable, true);
     forceUnlock();
   }
 
   private RWLockOwnerDocument buildCurrentOwner() {
-    return new RWLockOwnerDocument(
-        getCurrentHostname(), lease.getId(), getCurrentThreadName(), 1);
+    return new RWLockOwnerDocument(getCurrentHostname(), lease.getId(), getCurrentThreadName(), 1);
   }
 
   private record TryLockTxnResponse(
@@ -211,6 +212,7 @@ public final class DistributeReadWriteLockImp extends DistributeMongoSignalBase<
       return execLockTxnCommand(
           thisOwner,
           WRITE,
+          writeLockAvailable,
           lockObj -> {
             if (lockObj == null || lockObj.ownerHashCodes().isEmpty()) return false;
             return lockObj.mode != WRITE
@@ -322,6 +324,7 @@ public final class DistributeReadWriteLockImp extends DistributeMongoSignalBase<
   private boolean execLockTxnCommand(
       RWLockOwnerDocument thisOwner,
       RWLockMode mode,
+      Condition available,
       Predicate<LockStateObject> parkPredicate,
       Predicate<RWLockDocument> nonRetryablePredicate,
       Predicate<RWLockDocument> reenterPredicate,
@@ -367,7 +370,12 @@ public final class DistributeReadWriteLockImp extends DistributeMongoSignalBase<
               NANOSECONDS);
 
       safeUpdateModeIgnoreFailure(rsp.captureState, rsp.newObj);
-      if (rsp.tryLockSuccess) return true;
+      if (rsp.tryLockSuccess) {
+        if (mode.equals(READ)) {
+          unparkSuccessor(lock, available, false);
+        }
+        return true;
+      }
       Thread.onSpinWait();
     }
   }
@@ -390,6 +398,7 @@ public final class DistributeReadWriteLockImp extends DistributeMongoSignalBase<
       return execLockTxnCommand(
           thisOwner,
           READ,
+          readLockAvailable,
           lockObj -> {
             if (lockObj == null) return false;
             return (lockObj.mode == WRITE && !lockObj.ownerHashCodes.isEmpty());
@@ -573,7 +582,8 @@ public final class DistributeReadWriteLockImp extends DistributeMongoSignalBase<
                     currLockState,
                     new StatefulVar<LockStateObject>(null)))) {
           // 将锁的可用状态置空 代表可以执行读锁尝试 也可以执行写锁尝试
-          unparkSuccessor(lock, available, false);
+          unparkSuccessor(lock, writeLockAvailable, false);
+          unparkSuccessor(lock, readLockAvailable, false);
           return;
         }
 
@@ -601,7 +611,7 @@ public final class DistributeReadWriteLockImp extends DistributeMongoSignalBase<
                   DistributeReadWriteLockImp.this,
                   currLockState,
                   new StatefulVar<>(new LockStateObject(mode, ownerHashCodeList))))) {
-        unparkSuccessor(lock, available, false);
+        unparkSuccessor(lock, writeLockAvailable, false);
         return;
       }
       Thread.onSpinWait();
