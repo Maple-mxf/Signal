@@ -82,6 +82,7 @@ import org.bson.Document;
 import org.bson.conversions.Bson;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import signal.api.DistributeMutexLock;
 import signal.api.Lease;
 import signal.api.LeaseCreateConfig;
 import signal.api.SignalClient;
@@ -131,6 +132,8 @@ public class MongoSignalClient implements SignalClient {
 
   private final MongoClient mongoClient;
 
+  private final Lease lease;
+
   @SuppressWarnings("FutureReturnValueIgnored")
   private MongoSignalClient(MongoClient mongoClient, String dbNamed) {
     this.mongoClient = mongoClient;
@@ -144,6 +147,9 @@ public class MongoSignalClient implements SignalClient {
     this.executorService = Executors.newFixedThreadPool(8);
     this.executorService.submit(new ChangeStreamWatcher());
     this.timer = new Timer();
+
+    this.lease = this.grantLease(new LeaseCreateConfig());
+
     this.scheduleTimeToLiveTask();
     this.scheduleClearExpireLeaseTask();
   }
@@ -417,9 +423,9 @@ public class MongoSignalClient implements SignalClient {
   }
 
   private void scheduleClearExpireLeaseTask() {
-    //    CleanExpireSignalTask task = new CleanExpireSignalTask();
-    //    task.run();
-    //    timer.schedule(task, 1000L * 30, 1000L * 60L);
+    CleanExpireSignalTask task = new CleanExpireSignalTask();
+    task.run();
+    timer.schedule(task, 1000L * 30, 1000L * 60L);
   }
 
   @Override
@@ -484,6 +490,21 @@ public class MongoSignalClient implements SignalClient {
   private class CleanExpireSignalTask extends TimerTask {
     @Override
     public void run() {
+      DistributeMutexLock mutex = lease.getMutexLock("SignalClient-CleanExpireSignalTask");
+      try {
+        boolean locked = mutex.tryLock(10L, SECONDS);
+        if (!locked) return;
+        try {
+          doRun();
+        } finally {
+          mutex.unlock();
+        }
+      } catch (InterruptedException e) {
+        e.printStackTrace();
+      }
+    }
+
+    private void doRun() {
       var exclusiveSignalCollectionNamedList = new String[] {MUTEX_LOCK_NAMED};
       var shareSignalCollectionNamedList =
           new String[] {
