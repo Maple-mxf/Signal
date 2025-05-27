@@ -205,7 +205,6 @@ public final class DistributeReadWriteLockImp extends DistributeMongoSignalBase<
     @Override
     public boolean tryLock(Long waitTime, TimeUnit timeUnit) throws InterruptedException {
       RWLockOwnerDocument thisOwner = buildCurrentOwner(1);
-
       BiFunction<ClientSession, MongoCollection<RWLockDocument>, TryLockTxnResponse> command =
           (session, coll) -> {
             @SuppressWarnings("unchecked")
@@ -338,6 +337,81 @@ public final class DistributeReadWriteLockImp extends DistributeMongoSignalBase<
     }
   }
 
+  private BiFunction<ClientSession, MongoCollection<RWLockDocument>, TryLockTxnResponse>
+      buildLockTxnCommand(RWLockMode mode) {
+    RWLockOwnerDocument thisOwner = buildCurrentOwner(1);
+    BiFunction<ClientSession, MongoCollection<RWLockDocument>, TryLockTxnResponse> command =
+        (session, coll) -> {
+
+          // 执行之前先获取state revision的值，避免和wakeHead函数并发更新state的值冲突
+          @SuppressWarnings("unchecked")
+          StatefulVar<LockOwnerObject> state =
+              (StatefulVar<LockOwnerObject>)
+                  modeVarHandle.getAcquire(DistributeReadWriteLockImp.this);
+
+          RWLockDocument lock = coll.find(session, eq("_id", this.getKey())).first();
+          if (lock == null) {
+            lock = new RWLockDocument(key, mode, List.of(thisOwner), 1L);
+            InsertOneResult insertOneResult = coll.insertOne(session, lock);
+            boolean success =
+                insertOneResult.getInsertedId() != null && insertOneResult.wasAcknowledged();
+            return new TryLockTxnResponse(
+                success, !success, state, new LockOwnerObject(mode, Set.of(thisOwner.hashCode())));
+          }
+
+          // 如果当前锁的状态是写锁状态，并且有线程占用(包含当前线程占用写锁的情况，1个线程不允许同时获取读锁和写锁)，则需要挂起当前线程
+
+          if (!lock.owners().isEmpty() && lock.mode() == WRITE) {
+            return new TryLockTxnResponse(
+                false,
+                false,
+                state,
+                new LockOwnerObject(
+                    lock.mode(),
+                    lock.owners().stream()
+                        .map(RWLockOwnerDocument::hashCode)
+                        .collect(toUnmodifiableSet())));
+          }
+
+          long version = lock.version(), newVersion = version + 1L;
+
+          List<Bson> condList = new ArrayList<>(8);
+          condList.add(eq("_id", key));
+          condList.add(eq("version", version));
+
+          List<Bson> updateList = new ArrayList<>(8);
+          updateList.add(inc("version", 1L));
+
+          if (lock.owners().isEmpty()) {
+            updateList.add(set("mode", READ));
+            updateList.add(addToSet("owners", thisOwner));
+          } else if (lock.mode() == READ && lock.owners().contains(thisOwner)) {
+            condList.add(eq("owners.hostname", thisOwner.hostname()));
+            condList.add(eq("owners.lease", thisOwner.lease()));
+            condList.add(eq("owners.thread", thisOwner.thread()));
+            updateList.add(inc("owners.$.enter_count", 1));
+          }
+          boolean success =
+              (lock =
+                          coll.findOneAndUpdate(
+                              session, and(condList), combine(updateList), UPDATE_OPTIONS))
+                      != null
+                  && lock.version() == newVersion
+                  && lock.owners().contains(thisOwner);
+          return new TryLockTxnResponse(
+              success,
+              !success,
+              state,
+              success
+                  ? new LockOwnerObject(
+                      lock.mode(),
+                      lock.owners().stream()
+                          .map(RWLockOwnerDocument::hashCode)
+                          .collect(toUnmodifiableSet()))
+                  : null);
+        };
+  }
+
   @ThreadSafe
   @AutoService(DistributeReadLock.class)
   class DistributeReadLockImp extends DistributeMongoSignalBase<RWLockDocument>
@@ -367,7 +441,10 @@ public final class DistributeReadWriteLockImp extends DistributeMongoSignalBase<
               boolean success =
                   insertOneResult.getInsertedId() != null && insertOneResult.wasAcknowledged();
               return new TryLockTxnResponse(
-                  success, false, state, new LockOwnerObject(READ, Set.of(thisOwner.hashCode())));
+                  success,
+                  !success,
+                  state,
+                  new LockOwnerObject(READ, Set.of(thisOwner.hashCode())));
             }
 
             // 如果当前锁的状态是写锁状态，并且有线程占用(包含当前线程占用写锁的情况，1个线程不允许同时获取读锁和写锁)，则需要挂起当前线程
