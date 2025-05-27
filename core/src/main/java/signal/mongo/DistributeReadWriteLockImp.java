@@ -5,10 +5,10 @@ import static com.mongodb.client.model.Filters.eq;
 import static com.mongodb.client.model.Updates.addToSet;
 import static com.mongodb.client.model.Updates.combine;
 import static com.mongodb.client.model.Updates.inc;
+import static com.mongodb.client.model.Updates.pull;
 import static com.mongodb.client.model.Updates.set;
 import static java.lang.System.identityHashCode;
 import static java.lang.System.nanoTime;
-import static java.util.Collections.singletonList;
 import static java.util.concurrent.TimeUnit.NANOSECONDS;
 import static java.util.stream.Collectors.toUnmodifiableSet;
 import static signal.mongo.CollectionNamed.READ_WRITE_LOCK_NAMED;
@@ -18,6 +18,7 @@ import static signal.mongo.MongoErrorCode.WRITE_CONFLICT;
 import static signal.mongo.Utils.getCurrentHostname;
 import static signal.mongo.Utils.getCurrentThreadName;
 import static signal.mongo.Utils.parkCurrentThreadUntil;
+import static signal.mongo.Utils.unparkSuccessor;
 import static signal.mongo.pojo.RWLockMode.READ;
 import static signal.mongo.pojo.RWLockMode.WRITE;
 
@@ -36,11 +37,11 @@ import com.mongodb.client.MongoCollection;
 import com.mongodb.client.MongoDatabase;
 import com.mongodb.client.result.DeleteResult;
 import com.mongodb.client.result.InsertOneResult;
-
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.VarHandle;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
@@ -49,9 +50,9 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.BiFunction;
+import java.util.function.Predicate;
 import java.util.logging.Level;
 import java.util.logging.Logger;
-
 import org.bson.Document;
 import org.bson.conversions.Bson;
 import signal.api.DistributeReadWriteLock;
@@ -87,12 +88,12 @@ public final class DistributeReadWriteLockImp extends DistributeMongoSignalBase<
 
   private final Logger log = Logger.getLogger("DistributeReadWriteLock");
 
-  private record LockOwnerObject(RWLockMode mode, Set<Integer> ownerHashCodes) {
+  private record LockStateObject(RWLockMode mode, Set<Integer> ownerHashCodes) {
     @Override
     public boolean equals(Object o) {
       if (this == o) return true;
       if (o == null || getClass() != o.getClass()) return false;
-      LockOwnerObject that = (LockOwnerObject) o;
+      LockStateObject that = (LockStateObject) o;
       return mode == that.mode && Objects.equals(ownerHashCodes, that.ownerHashCodes);
     }
 
@@ -111,7 +112,7 @@ public final class DistributeReadWriteLockImp extends DistributeMongoSignalBase<
   @Keep
   @GuardedBy("modeVarHandle")
   @VisibleForTesting
-  final StatefulVar<LockOwnerObject> state;
+  final StatefulVar<LockStateObject> state;
 
   private final VarHandle modeVarHandle;
 
@@ -153,7 +154,7 @@ public final class DistributeReadWriteLockImp extends DistributeMongoSignalBase<
   }
 
   private void safeUpdateModeIgnoreFailure(
-      StatefulVar<LockOwnerObject> captureState, LockOwnerObject newObj) {
+      StatefulVar<LockStateObject> captureState, LockStateObject newObj) {
     Object oldObj =
         modeVarHandle.compareAndExchangeRelease(
             DistributeReadWriteLockImp.this, captureState, new StatefulVar<>(newObj));
@@ -166,30 +167,30 @@ public final class DistributeReadWriteLockImp extends DistributeMongoSignalBase<
   @Override
   protected void doClose() {
     eventBus.unregister(this);
-    unparkSuccessor(true);
     readLockImp.close();
     writeLockImp.close();
+    unparkSuccessor(lock, available, true);
     forceUnlock();
   }
 
-  private RWLockOwnerDocument buildCurrentOwner(int enterCount) {
+  private RWLockOwnerDocument buildCurrentOwner() {
     return new RWLockOwnerDocument(
-        getCurrentHostname(), lease.getLeaseID(), getCurrentThreadName(), enterCount);
+        getCurrentHostname(), lease.getLeaseID(), getCurrentThreadName(), 1);
   }
 
   private record TryLockTxnResponse(
       boolean tryLockSuccess,
       boolean retryable,
-      StatefulVar<LockOwnerObject> captureState,
-      LockOwnerObject newObj) {}
+      StatefulVar<LockStateObject> captureState,
+      LockStateObject newObj) {}
 
   private record UnlockTxnResponse(
       boolean unlockSuccess,
       boolean retryable,
       String exceptionMessage,
       boolean casUpdateState,
-      StatefulVar<LockOwnerObject> captureState,
-      LockOwnerObject newObj) {}
+      StatefulVar<LockStateObject> captureState,
+      LockStateObject newObj) {}
 
   @ThreadSafe
   @AutoService(DistributeWriteLock.class)
@@ -204,113 +205,22 @@ public final class DistributeReadWriteLockImp extends DistributeMongoSignalBase<
     @CheckReturnValue
     @Override
     public boolean tryLock(Long waitTime, TimeUnit timeUnit) throws InterruptedException {
-      RWLockOwnerDocument thisOwner = buildCurrentOwner(1);
-      BiFunction<ClientSession, MongoCollection<RWLockDocument>, TryLockTxnResponse> command =
-          (session, coll) -> {
-            @SuppressWarnings("unchecked")
-            StatefulVar<LockOwnerObject> state =
-                (StatefulVar<LockOwnerObject>)
-                    modeVarHandle.getAcquire(DistributeReadWriteLockImp.this);
-
-            RWLockDocument lock = coll.find(session, eq("_id", this.getKey())).first();
-            if (lock == null) {
-              lock = new RWLockDocument(key, WRITE, singletonList(thisOwner), 1L);
-              InsertOneResult insertOneResult = coll.insertOne(session, lock);
-              boolean success = insertOneResult.getInsertedId() != null;
-              return new TryLockTxnResponse(
-                  success,
-                  !success,
-                  state,
-                  new LockOwnerObject(WRITE, Set.of(thisOwner.hashCode())));
-            }
-            if (!lock.owners().isEmpty() && !lock.owners().contains(thisOwner)) {
-              return new TryLockTxnResponse(
-                  false,
-                  false,
-                  state,
-                  new LockOwnerObject(
-                      lock.mode(),
-                      lock.owners().stream().map(Object::hashCode).collect(toUnmodifiableSet())));
-            }
-
-            long version = lock.version(), newVersion = version + 1;
-
-            List<Bson> condList = new ArrayList<>(8);
-            condList.add(eq("_id", this.getKey()));
-            condList.add(eq("version", version));
-
-            List<Bson> updateList = new ArrayList<>(8);
-            updateList.add(inc("version", 1L));
-
-            if (lock.owners().contains(thisOwner)) {
-              condList.add(eq("owners.hostname", thisOwner.hostname()));
-              condList.add(eq("owners.lease", thisOwner.lease()));
-              condList.add(eq("owners.thread", thisOwner.thread()));
-              updateList.add(inc("owners.$.enter_count", 1));
-            } else if (lock.owners().isEmpty()) {
-              updateList.add(addToSet("owners", thisOwner));
-              updateList.add(set("mode", WRITE));
-            }
-            boolean success =
-                (lock =
-                            coll.findOneAndUpdate(
-                                session, and(condList), combine(updateList), UPDATE_OPTIONS))
-                        != null
-                    && lock.version() == newVersion
-                    && lock.owners().contains(thisOwner);
-            return new TryLockTxnResponse(
-                success,
-                !success,
-                state,
-                success ? new LockOwnerObject(lock.mode(), Set.of(thisOwner.hashCode())) : null);
-          };
-
+      RWLockOwnerDocument thisOwner = buildCurrentOwner();
       long s = nanoTime(), waitTimeNanos = timeUnit.toNanos(waitTime);
       boolean timed = waitTime > 0;
-
-      Next:
-      for (; ; ) {
-        checkState();
-
-        // 尝试着挂起当前线程
-        boolean elapsed =
-            parkCurrentThreadUntil(
-                lock,
-                available,
-                () -> {
-                  @SuppressWarnings("unchecked")
-                  StatefulVar<LockOwnerObject> sv =
-                      (StatefulVar<LockOwnerObject>)
-                          modeVarHandle.getAcquire(DistributeReadWriteLockImp.this);
-                  if (sv.value == null || sv.value.ownerHashCodes().isEmpty()) return false;
-
-                  return sv.value.mode != WRITE
-                      || !sv.value.ownerHashCodes().contains(thisOwner.hashCode());
-                },
-                timed,
-                s,
-                (waitTimeNanos - (nanoTime() - s)));
-
-        if (!elapsed) {
-          log.log(Level.WARNING, "Timeout.");
-          return false;
-        }
-
-        TryLockTxnResponse rsp =
-            commandExecutor.loopExecute(
-                command,
-                commandExecutor.defaultDBErrorHandlePolicy(
-                    NO_SUCH_TRANSACTION, WRITE_CONFLICT, DUPLICATE_KEY),
-                null,
-                t -> t.retryable && !t.tryLockSuccess,
-                timed,
-                timed ? (waitTimeNanos - (nanoTime() - s)) : -1L,
-                NANOSECONDS);
-
-        safeUpdateModeIgnoreFailure(rsp.captureState, rsp.newObj);
-        if (rsp.tryLockSuccess) return true;
-        Thread.onSpinWait();
-      }
+      return execLockTxnCommand(
+          thisOwner,
+          WRITE,
+          lockObj -> {
+            if (lockObj == null || lockObj.ownerHashCodes().isEmpty()) return false;
+            return lockObj.mode != WRITE
+                && !lockObj.ownerHashCodes().contains(thisOwner.hashCode());
+          },
+          lock -> (!lock.owners().isEmpty() && lock.mode() == WRITE),
+          lock -> lock.mode() == READ && lock.owners().contains(thisOwner),
+          s,
+          waitTimeNanos,
+          timed);
     }
 
     @Override
@@ -338,78 +248,128 @@ public final class DistributeReadWriteLockImp extends DistributeMongoSignalBase<
   }
 
   private BiFunction<ClientSession, MongoCollection<RWLockDocument>, TryLockTxnResponse>
-      buildLockTxnCommand(RWLockMode mode) {
-    RWLockOwnerDocument thisOwner = buildCurrentOwner(1);
-    BiFunction<ClientSession, MongoCollection<RWLockDocument>, TryLockTxnResponse> command =
-        (session, coll) -> {
+      buildLockTxnCommand(
+          RWLockOwnerDocument thisOwner,
+          RWLockMode mode,
+          Predicate<RWLockDocument> nonRetryablePredicate,
+          Predicate<RWLockDocument> reenterPredicate) {
+    return (session, coll) -> {
+      @SuppressWarnings("unchecked")
+      StatefulVar<LockStateObject> state1 =
+          (StatefulVar<LockStateObject>) modeVarHandle.getAcquire(this);
 
-          // 执行之前先获取state revision的值，避免和wakeHead函数并发更新state的值冲突
-          @SuppressWarnings("unchecked")
-          StatefulVar<LockOwnerObject> state =
-              (StatefulVar<LockOwnerObject>)
-                  modeVarHandle.getAcquire(DistributeReadWriteLockImp.this);
+      RWLockDocument lock1 = coll.find(session, eq("_id", this.getKey())).first();
+      if (lock1 == null) {
+        lock1 = new RWLockDocument(key, mode, List.of(thisOwner), 1L);
+        InsertOneResult insertOneResult = coll.insertOne(session, lock1);
+        boolean success =
+            insertOneResult.getInsertedId() != null && insertOneResult.wasAcknowledged();
+        return new TryLockTxnResponse(
+            success, !success, state1, new LockStateObject(mode, Set.of(thisOwner.hashCode())));
+      }
 
-          RWLockDocument lock = coll.find(session, eq("_id", this.getKey())).first();
-          if (lock == null) {
-            lock = new RWLockDocument(key, mode, List.of(thisOwner), 1L);
-            InsertOneResult insertOneResult = coll.insertOne(session, lock);
-            boolean success =
-                insertOneResult.getInsertedId() != null && insertOneResult.wasAcknowledged();
-            return new TryLockTxnResponse(
-                success, !success, state, new LockOwnerObject(mode, Set.of(thisOwner.hashCode())));
-          }
+      if (nonRetryablePredicate.test(lock1)) {
+        return new TryLockTxnResponse(
+            false,
+            false,
+            state1,
+            new LockStateObject(
+                lock1.mode(),
+                lock1.owners().stream()
+                    .map(RWLockOwnerDocument::hashCode)
+                    .collect(toUnmodifiableSet())));
+      }
 
-          // 如果当前锁的状态是写锁状态，并且有线程占用(包含当前线程占用写锁的情况，1个线程不允许同时获取读锁和写锁)，则需要挂起当前线程
+      long version = lock1.version(), newVersion = version + 1L;
 
-          if (!lock.owners().isEmpty() && lock.mode() == WRITE) {
-            return new TryLockTxnResponse(
-                false,
-                false,
-                state,
-                new LockOwnerObject(
-                    lock.mode(),
-                    lock.owners().stream()
-                        .map(RWLockOwnerDocument::hashCode)
-                        .collect(toUnmodifiableSet())));
-          }
+      List<Bson> condList = new ArrayList<>(8);
+      condList.add(eq("_id", key));
+      condList.add(eq("version", version));
 
-          long version = lock.version(), newVersion = version + 1L;
+      List<Bson> updateList = new ArrayList<>(8);
+      updateList.add(inc("version", 1L));
 
-          List<Bson> condList = new ArrayList<>(8);
-          condList.add(eq("_id", key));
-          condList.add(eq("version", version));
+      if (reenterPredicate.test(lock1)) {
+        condList.add(eq("owners.hostname", thisOwner.hostname()));
+        condList.add(eq("owners.lease", thisOwner.lease()));
+        condList.add(eq("owners.thread", thisOwner.thread()));
+        updateList.add(inc("owners.$.enter_count", 1));
+      } else {
+        updateList.add(set("mode", mode));
+        updateList.add(addToSet("owners", thisOwner));
+      }
+      boolean success =
+          (lock1 =
+                      coll.findOneAndUpdate(
+                          session, and(condList), combine(updateList), UPDATE_OPTIONS))
+                  != null
+              && lock1.version() == newVersion
+              && lock1.owners().contains(thisOwner);
+      return new TryLockTxnResponse(
+          success,
+          !success,
+          state1,
+          success
+              ? new LockStateObject(
+                  lock1.mode(),
+                  lock1.owners().stream()
+                      .map(RWLockOwnerDocument::hashCode)
+                      .collect(toUnmodifiableSet()))
+              : null);
+    };
+  }
 
-          List<Bson> updateList = new ArrayList<>(8);
-          updateList.add(inc("version", 1L));
+  private boolean execLockTxnCommand(
+      RWLockOwnerDocument thisOwner,
+      RWLockMode mode,
+      Predicate<LockStateObject> parkPredicate,
+      Predicate<RWLockDocument> nonRetryablePredicate,
+      Predicate<RWLockDocument> reenterPredicate,
+      long startNanos,
+      long waitTimeNanos,
+      boolean timed)
+      throws InterruptedException {
 
-          if (lock.owners().isEmpty()) {
-            updateList.add(set("mode", READ));
-            updateList.add(addToSet("owners", thisOwner));
-          } else if (lock.mode() == READ && lock.owners().contains(thisOwner)) {
-            condList.add(eq("owners.hostname", thisOwner.hostname()));
-            condList.add(eq("owners.lease", thisOwner.lease()));
-            condList.add(eq("owners.thread", thisOwner.thread()));
-            updateList.add(inc("owners.$.enter_count", 1));
-          }
-          boolean success =
-              (lock =
-                          coll.findOneAndUpdate(
-                              session, and(condList), combine(updateList), UPDATE_OPTIONS))
-                      != null
-                  && lock.version() == newVersion
-                  && lock.owners().contains(thisOwner);
-          return new TryLockTxnResponse(
-              success,
-              !success,
-              state,
-              success
-                  ? new LockOwnerObject(
-                      lock.mode(),
-                      lock.owners().stream()
-                          .map(RWLockOwnerDocument::hashCode)
-                          .collect(toUnmodifiableSet()))
-                  : null);
-        };
+    for (; ; ) {
+      checkState();
+      boolean elapsed =
+          parkCurrentThreadUntil(
+              lock,
+              available,
+              () -> {
+                @SuppressWarnings("unchecked")
+                StatefulVar<LockStateObject> sv =
+                    ((StatefulVar<LockStateObject>)
+                        (modeVarHandle.getAcquire(DistributeReadWriteLockImp.this)));
+                return parkPredicate.test(sv.value);
+              },
+              timed,
+              startNanos,
+              (waitTimeNanos - (nanoTime() - startNanos)));
+
+      if (!elapsed) {
+        log.log(Level.INFO, "Timeout.");
+        return false;
+      }
+
+      BiFunction<ClientSession, MongoCollection<RWLockDocument>, TryLockTxnResponse> command =
+          this.buildLockTxnCommand(thisOwner, mode, nonRetryablePredicate, reenterPredicate);
+
+      TryLockTxnResponse rsp =
+          commandExecutor.loopExecute(
+              command,
+              commandExecutor.defaultDBErrorHandlePolicy(
+                  NO_SUCH_TRANSACTION, WRITE_CONFLICT, DUPLICATE_KEY),
+              null,
+              t -> !t.tryLockSuccess && t.retryable,
+              timed,
+              timed ? (waitTimeNanos - (nanoTime() - startNanos)) : -1L,
+              NANOSECONDS);
+
+      safeUpdateModeIgnoreFailure(rsp.captureState, rsp.newObj);
+      if (rsp.tryLockSuccess) return true;
+      Thread.onSpinWait();
+    }
   }
 
   @ThreadSafe
@@ -424,122 +384,21 @@ public final class DistributeReadWriteLockImp extends DistributeMongoSignalBase<
     @CheckReturnValue
     @Override
     public boolean tryLock(Long waitTime, TimeUnit timeUnit) throws InterruptedException {
-      RWLockOwnerDocument thisOwner = buildCurrentOwner(1);
-      BiFunction<ClientSession, MongoCollection<RWLockDocument>, TryLockTxnResponse> command =
-          (session, coll) -> {
-
-            // 执行之前先获取state revision的值，避免和wakeHead函数并发更新state的值冲突
-            @SuppressWarnings("unchecked")
-            StatefulVar<LockOwnerObject> state =
-                (StatefulVar<LockOwnerObject>)
-                    modeVarHandle.getAcquire(DistributeReadWriteLockImp.this);
-
-            RWLockDocument lock = coll.find(session, eq("_id", this.getKey())).first();
-            if (lock == null) {
-              lock = new RWLockDocument(key, READ, List.of(thisOwner), 1L);
-              InsertOneResult insertOneResult = coll.insertOne(session, lock);
-              boolean success =
-                  insertOneResult.getInsertedId() != null && insertOneResult.wasAcknowledged();
-              return new TryLockTxnResponse(
-                  success,
-                  !success,
-                  state,
-                  new LockOwnerObject(READ, Set.of(thisOwner.hashCode())));
-            }
-
-            // 如果当前锁的状态是写锁状态，并且有线程占用(包含当前线程占用写锁的情况，1个线程不允许同时获取读锁和写锁)，则需要挂起当前线程
-            if (!lock.owners().isEmpty() && lock.mode() == WRITE) {
-              return new TryLockTxnResponse(
-                  false,
-                  false,
-                  state,
-                  new LockOwnerObject(
-                      WRITE,
-                      lock.owners().stream()
-                          .map(RWLockOwnerDocument::hashCode)
-                          .collect(toUnmodifiableSet())));
-            }
-
-            long version = lock.version(), newVersion = version + 1L;
-
-            List<Bson> condList = new ArrayList<>(8);
-            condList.add(eq("_id", key));
-            condList.add(eq("version", version));
-
-            List<Bson> updateList = new ArrayList<>(8);
-            updateList.add(inc("version", 1L));
-
-            if (lock.owners().isEmpty()) {
-              updateList.add(set("mode", READ));
-              updateList.add(addToSet("owners", thisOwner));
-            } else if (lock.mode() == READ && lock.owners().contains(thisOwner)) {
-              condList.add(eq("owners.hostname", thisOwner.hostname()));
-              condList.add(eq("owners.lease", thisOwner.lease()));
-              condList.add(eq("owners.thread", thisOwner.thread()));
-              updateList.add(inc("owners.$.enter_count", 1));
-            }
-            boolean success =
-                (lock =
-                            coll.findOneAndUpdate(
-                                session, and(condList), combine(updateList), UPDATE_OPTIONS))
-                        != null
-                    && lock.version() == newVersion
-                    && lock.owners().contains(thisOwner);
-            return new TryLockTxnResponse(
-                success,
-                !success,
-                state,
-                success
-                    ? new LockOwnerObject(
-                        lock.mode(),
-                        lock.owners().stream()
-                            .map(RWLockOwnerDocument::hashCode)
-                            .collect(toUnmodifiableSet()))
-                    : null);
-          };
-
+      RWLockOwnerDocument thisOwner = buildCurrentOwner();
       long s = nanoTime(), waitTimeNanos = timeUnit.toNanos(waitTime);
       boolean timed = waitTime > 0;
-
-      for (; ; ) {
-        checkState();
-
-        boolean elapsed =
-            parkCurrentThreadUntil(
-                lock,
-                available,
-                () -> {
-                  @SuppressWarnings("unchecked")
-                  StatefulVar<LockOwnerObject> sv =
-                      ((StatefulVar<LockOwnerObject>)
-                          (modeVarHandle.getAcquire(DistributeReadWriteLockImp.this)));
-                  if (sv.value == null) return false;
-                  return (sv.value.mode == WRITE && !sv.value.ownerHashCodes.isEmpty());
-                },
-                timed,
-                s,
-                (waitTimeNanos - (nanoTime() - s)));
-
-        if (!elapsed) {
-          log.log(Level.INFO, "Timeout.");
-          return false;
-        }
-
-        TryLockTxnResponse rsp =
-            commandExecutor.loopExecute(
-                command,
-                commandExecutor.defaultDBErrorHandlePolicy(
-                    NO_SUCH_TRANSACTION, WRITE_CONFLICT, DUPLICATE_KEY),
-                null,
-                t -> !t.tryLockSuccess && t.retryable,
-                timed,
-                timed ? (waitTimeNanos - (nanoTime() - s)) : -1L,
-                NANOSECONDS);
-
-        safeUpdateModeIgnoreFailure(rsp.captureState, rsp.newObj);
-        if (rsp.tryLockSuccess) return true;
-        Thread.onSpinWait();
-      }
+      return execLockTxnCommand(
+          thisOwner,
+          READ,
+          lockObj -> {
+            if (lockObj == null) return false;
+            return (lockObj.mode == WRITE && !lockObj.ownerHashCodes.isEmpty());
+          },
+          lock -> (!lock.owners().isEmpty() && lock.mode() == WRITE),
+          lock -> lock.mode() == READ && lock.owners().contains(thisOwner),
+          s,
+          waitTimeNanos,
+          timed);
     }
 
     @Override
@@ -594,11 +453,11 @@ public final class DistributeReadWriteLockImp extends DistributeMongoSignalBase<
 
   private BiFunction<ClientSession, MongoCollection<RWLockDocument>, UnlockTxnResponse>
       buildUnlockTxnCommand(RWLockMode mode) {
-    RWLockOwnerDocument thisOwner = buildCurrentOwner(1);
+    RWLockOwnerDocument thisOwner = buildCurrentOwner();
     return (session, coll) -> {
       @SuppressWarnings("unchecked")
-      StatefulVar<LockOwnerObject> state1 =
-          (StatefulVar<LockOwnerObject>) modeVarHandle.getAcquire(this);
+      StatefulVar<LockStateObject> state1 =
+          (StatefulVar<LockStateObject>) modeVarHandle.getAcquire(this);
 
       RWLockDocument lock = coll.find(session, eq("_id", key)).first();
       if (lock == null || lock.mode() != mode || !lock.owners().contains(thisOwner)) {
@@ -610,7 +469,7 @@ public final class DistributeReadWriteLockImp extends DistributeMongoSignalBase<
             state1,
             lock == null
                 ? null
-                : new LockOwnerObject(
+                : new LockStateObject(
                     lock.mode(),
                     lock.owners().stream()
                         .map(RWLockOwnerDocument::hashCode)
@@ -647,7 +506,7 @@ public final class DistributeReadWriteLockImp extends DistributeMongoSignalBase<
           state1,
           lock == null
               ? null
-              : new LockOwnerObject(
+              : new LockStateObject(
                   lock.mode(),
                   lock.owners().stream()
                       .map(RWLockOwnerDocument::hashCode)
@@ -655,75 +514,66 @@ public final class DistributeReadWriteLockImp extends DistributeMongoSignalBase<
     };
   }
 
-  //  private void forceUnlock() {
-  //    BiFunction<ClientSession, MongoCollection<Document>, CommonTxnResponse> command =
-  //        (session, coll) -> {
-  //          Document lock = coll.find(session, eq("_id", this.getKey())).first();
-  //          if (lock == null) return ok();
-  //
-  //          List<Document> holders = lock.getList("o", Document.class);
-  //
-  //          // 达到删除条件
-  //          long revision = lock.getLong("v"), newRevision = revision + 1;
-  //          var filter = and(eq("_id", this.getKey()), eq("v", revision));
-  //          if (holders == null || holders.isEmpty()) {
-  //            DeleteResult deleteResult = coll.deleteOne(session, filter);
-  //            return deleteResult.getDeletedCount() == 1L ? ok() : retryableError();
-  //          }
-  //
-  //          // 将所有的Holder删除
-  //          var update = pull("o", new Document("lease", this.getLease().getLeaseID()));
-  //          return ((lock = coll.findOneAndUpdate(session, filter, update, UPDATE_OPTIONS)) !=
-  // null
-  //                  && lock.getLong("v") == newRevision
-  //                  && ((holders = lock.getList("o", Document.class)) == null
-  //                      || holders.isEmpty()
-  //                      || holders.stream()
-  //                          .noneMatch(
-  //                              t -> t.getString("lease").equals(this.getLease().getLeaseID()))))
-  //              ? ok()
-  //              : retryableError();
-  //        };
-  //
-  //    CommonTxnResponse txnResponse =
-  //        commandExecutor.loopExecute(
-  //            command,
-  //            commandExecutor.defaultDBErrorHandlePolicy(
-  //                NO_SUCH_TRANSACTION, WRITE_CONFLICT, LOCK_FAILED),
-  //            null,
-  //            t -> !t.txnOk && t.retryable);
-  //
-  //    if (!txnResponse.txnOk) throw new SignalException("Unknown Error.");
-  //  }
+  private void forceUnlock() {
+    BiFunction<ClientSession, MongoCollection<RWLockDocument>, Boolean> command =
+        (session, coll) -> {
+          RWLockDocument lock = coll.find(session, eq("_id", this.getKey())).first();
+          if (lock == null) return true;
 
-  /**
-   * 满足条件会唤醒头部线程 并且将{@link DistributeWriteLockImp#mode} 设置为空或者"r"
-   *
-   * @param event 删除事件或者锁的修改事件
-   */
+          // 达到删除条件
+          long version = lock.version(), newVersion = version + 1;
+          var filter = and(eq("_id", this.getKey()), eq("version", version));
+          if (lock.owners().isEmpty()) {
+            DeleteResult deleteResult = coll.deleteOne(session, filter);
+            return deleteResult.getDeletedCount() == 1L && deleteResult.wasAcknowledged();
+          }
+
+          // 将所有的Holder删除
+          var update = pull("owners", new Document("lease", lease.getLeaseID()));
+          return ((lock = coll.findOneAndUpdate(session, filter, update, UPDATE_OPTIONS)) != null
+              && lock.version() == newVersion
+              && (lock.owners().stream().noneMatch(t -> t.lease().equals(lease.getLeaseID()))));
+        };
+
+    Boolean forceUnlockRsp =
+        commandExecutor.loopExecute(
+            command,
+            commandExecutor.defaultDBErrorHandlePolicy(
+                NO_SUCH_TRANSACTION, WRITE_CONFLICT, DUPLICATE_KEY),
+            null,
+            t -> !t);
+
+    log.log(Level.INFO, "forceUnlockRsp: {0}", new Object[] {forceUnlockRsp});
+  }
+
   @DoNotCall
   @Subscribe
   void awakeSuccessor(ChangeStreamEvents.ReadWriteLockChangeAndRemovedEvent event) {
     Document fullDocument = event.fullDocument();
 
-    List<Document> holders =
-        Optional.ofNullable(fullDocument).map(t -> t.getList("o", Document.class)).orElse(null);
+    List<Document> owners =
+        Optional.ofNullable(fullDocument)
+            .map(t -> t.getList("owners", Document.class))
+            .orElse(Collections.emptyList());
 
     Next:
     for (; ; ) {
       // 执行之前先获取state的值，避免和lock函数并发更新state的值冲突
-      StatefulVar<String> currState =
-          (StatefulVar<String>) modeVarHandle.getAcquire(DistributeReadWriteLockImp.this);
+      @SuppressWarnings("unchecked")
+      StatefulVar<LockStateObject> currLockState =
+          (StatefulVar<LockStateObject>) modeVarHandle.getAcquire(DistributeReadWriteLockImp.this);
+      int currLockStateHashCode = identityHashCode(currLockState);
 
       // 当fullDocument为空时，对应的锁数据被删除的操作
-      if (fullDocument == null || holders == null || holders.isEmpty()) {
-
-        if (identityHashCode(currState)
+      if (fullDocument == null || owners.isEmpty()) {
+        if (currLockStateHashCode
             == identityHashCode(
                 modeVarHandle.compareAndExchangeRelease(
-                    DistributeReadWriteLockImp.this, currState, new StatefulVar<>("")))) {
+                    DistributeReadWriteLockImp.this,
+                    currLockState,
+                    new StatefulVar<LockStateObject>(null)))) {
           // 将锁的可用状态置空 代表可以执行读锁尝试 也可以执行写锁尝试
-          unparkSuccessor(false);
+          unparkSuccessor(lock, available, false);
           return;
         }
 
@@ -731,19 +581,31 @@ public final class DistributeReadWriteLockImp extends DistributeMongoSignalBase<
         continue Next;
       }
 
-      String mode = fullDocument.getString("m");
-      if (READ_MODE.equals(mode) && !holders.isEmpty()) {
-        if (identityHashCode(currState)
-            == identityHashCode(
-                modeVarHandle.compareAndExchangeRelease(
-                    DistributeReadWriteLockImp.this, currState, new StatefulVar<>("r")))) {
-          // 在写锁模式下，将锁的可用状态设置为r，代表读锁线程可以尝试着获取锁资源
-          unparkSuccessor(false);
-          return;
-        }
-        Thread.onSpinWait();
-        continue Next;
+      RWLockMode mode = RWLockMode.valueOf(fullDocument.getString("mode"));
+
+      Set<Integer> ownerHashCodeList =
+          fullDocument.getList("owners", Document.class).stream()
+              .map(
+                  doc ->
+                      new RWLockOwnerDocument(
+                              doc.getString("hostname"),
+                              doc.getString("lease"),
+                              doc.getString("thread"),
+                              doc.getInteger("enter_count"))
+                          .hashCode())
+              .collect(toUnmodifiableSet());
+
+      if (currLockStateHashCode
+          == identityHashCode(
+              modeVarHandle.compareAndExchangeRelease(
+                  DistributeReadWriteLockImp.this,
+                  currLockState,
+                  new StatefulVar<>(new LockStateObject(mode, ownerHashCodeList))))) {
+        unparkSuccessor(lock, available, false);
+        return;
       }
+      Thread.onSpinWait();
+      continue Next;
     }
   }
 }
