@@ -188,7 +188,7 @@ final class DistributeDoubleBarrierImp extends DistributeMongoSignalBase<DoubleB
 
   private DoubleBarrierPartnerDocument buildCurrentPartner() {
     return new DoubleBarrierPartnerDocument(
-        Utils.getCurrentHostname(), this.getLease().getLeaseID(), Utils.getCurrentThreadName());
+        Utils.getCurrentHostname(), this.getLease().getId(), Utils.getCurrentThreadName());
   }
 
   @Override

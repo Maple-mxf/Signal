@@ -184,7 +184,7 @@ final class DistributeCountDownLatchImp extends DistributeMongoSignalBase<CountD
 
   private CountDownLatchWaiterDocument buildCurrentWaiter() {
     return new CountDownLatchWaiterDocument(
-        Utils.getCurrentHostname(), this.lease.getLeaseID(), Utils.getCurrentThreadName());
+        Utils.getCurrentHostname(), this.lease.getId(), Utils.getCurrentThreadName());
   }
 
   @Override

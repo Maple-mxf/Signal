@@ -4,43 +4,26 @@ import java.time.Instant;
 
 /** Lease */
 public abstract class Lease {
-  /**
-   * 全局唯一ID
-   */
-  protected final String leaseID;
-  /**
-   * 创建者
-   */
-  protected final Holder holder;
+  /** 全局唯一ID */
+  protected final String id;
 
-  /**
-   * 创建时间
-   */
+  /** 创建时间 */
   protected final Instant createdTime;
 
   /**
-   * @param leaseID 全局唯一ID
-   * @param holder 创建者
+   * @param id 全局唯一ID
    * @param createdTime 创建时间
    */
-  public Lease(String leaseID, Holder holder, Instant createdTime) {
-    this.leaseID = leaseID;
-    this.holder = holder;
+  public Lease(String id, Instant createdTime) {
+    this.id = id;
     this.createdTime = createdTime;
   }
 
   /**
    * @return leaseID
    */
-  public String getLeaseID() {
-    return leaseID;
-  }
-
-  /**
-   * @return holder
-   */
-  public Holder getHolder() {
-    return holder;
+  public String getId() {
+    return id;
   }
 
   /**

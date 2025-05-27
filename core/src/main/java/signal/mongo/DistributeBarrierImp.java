@@ -176,7 +176,7 @@ public final class DistributeBarrierImp extends DistributeMongoSignalBase<Barrie
 
   private BarrierWaiterDocument buildCurrentWaiter() {
     return new BarrierWaiterDocument(
-        Utils.getCurrentHostname(), this.getLease().getLeaseID(), Utils.getCurrentThreadName());
+        Utils.getCurrentHostname(), this.getLease().getId(), Utils.getCurrentThreadName());
   }
 
   @Override

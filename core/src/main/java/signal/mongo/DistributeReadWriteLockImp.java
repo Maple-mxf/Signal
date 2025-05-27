@@ -175,7 +175,7 @@ public final class DistributeReadWriteLockImp extends DistributeMongoSignalBase<
 
   private RWLockOwnerDocument buildCurrentOwner() {
     return new RWLockOwnerDocument(
-        getCurrentHostname(), lease.getLeaseID(), getCurrentThreadName(), 1);
+        getCurrentHostname(), lease.getId(), getCurrentThreadName(), 1);
   }
 
   private record TryLockTxnResponse(
@@ -529,10 +529,10 @@ public final class DistributeReadWriteLockImp extends DistributeMongoSignalBase<
           }
 
           // 将所有的Holder删除
-          var update = pull("owners", new Document("lease", lease.getLeaseID()));
+          var update = pull("owners", new Document("lease", lease.getId()));
           return ((lock = coll.findOneAndUpdate(session, filter, update, UPDATE_OPTIONS)) != null
               && lock.version() == newVersion
-              && (lock.owners().stream().noneMatch(t -> t.lease().equals(lease.getLeaseID()))));
+              && (lock.owners().stream().noneMatch(t -> t.lease().equals(lease.getId()))));
         };
 
     Boolean forceUnlockRsp =

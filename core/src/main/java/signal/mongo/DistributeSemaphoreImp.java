@@ -170,7 +170,7 @@ public class DistributeSemaphoreImp extends DistributeMongoSignalBase<SemaphoreD
   private SemaphoreOwnerDocument buildCurrentOwner(int permits) {
     return new SemaphoreOwnerDocument(
         getCurrentHostname(),
-        this.getLease().getLeaseID(),
+        this.getLease().getId(),
         allowReleaseWithoutAcquire ? "" : getCurrentThreadName(),
         permits);
   }
@@ -388,7 +388,7 @@ public class DistributeSemaphoreImp extends DistributeMongoSignalBase<SemaphoreD
           if (sd == null || this.permits() != sd.permits()) return true;
 
           List<SemaphoreOwnerDocument> thisOwners = sd.owners();
-          if (thisOwners.stream().noneMatch(t -> this.getLease().getLeaseID().equals(t.lease()))) {
+          if (thisOwners.stream().noneMatch(t -> this.getLease().getId().equals(t.lease()))) {
             return true;
           }
           long version = sd.version(), newVersion = version + 1L;
@@ -398,12 +398,12 @@ public class DistributeSemaphoreImp extends DistributeMongoSignalBase<SemaphoreD
                   eq("version", sd.version()),
                   eq("permits", this.permits()));
           if (thisOwners.isEmpty()
-              || thisOwners.stream().allMatch(t -> t.lease().equals(getLease().getLeaseID()))) {
+              || thisOwners.stream().allMatch(t -> t.lease().equals(getLease().getId()))) {
             DeleteResult deleteResult = coll.deleteOne(session, filter);
             return deleteResult.getDeletedCount() == 1L;
           }
           var update =
-              combine(pull("owners", eq("lease", getLease().getLeaseID())), inc("version", 1));
+              combine(pull("owners", eq("lease", getLease().getId())), inc("version", 1));
           return (sd = coll.findOneAndUpdate(session, filter, update)) != null
               && sd.version() == newVersion;
         };

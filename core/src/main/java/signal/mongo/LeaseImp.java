@@ -20,7 +20,6 @@ import signal.api.DistributeDoubleBarrier;
 import signal.api.DistributeMutexLock;
 import signal.api.DistributeReadWriteLock;
 import signal.api.DistributeSemaphore;
-import signal.api.Holder;
 import signal.api.Lease;
 
 @AutoService(Lease.class)
@@ -34,19 +33,16 @@ final class LeaseImp extends Lease {
   private boolean revoked = false;
 
   LeaseImp(MongoClient client, MongoDatabase db, String leaseID) {
-    super(leaseID, Holder.self(leaseID), Instant.now(Clock.systemUTC()));
+    super(leaseID, Instant.now(Clock.systemUTC()));
     this.client = client;
     this.db = db;
     this.leaseScopedEventBus = new EventBus(leaseID);
     this.collection = db.getCollection(CollectionNamed.LEASE_NAMED);
-    Holder holder = this.getHolder();
+
     Instant now = this.getCreatedTime();
     InsertOneResult insertOneResult =
         this.collection.insertOne(
             new Document("_id", leaseID)
-                .append(
-                    "o",
-                    new Document("hostname", holder.hostname()).append("thread", holder.thread()))
                 .append("createAt", now)
                 .append("expireAt", now.plusSeconds(30)));
 
@@ -61,7 +57,7 @@ final class LeaseImp extends Lease {
   @Override
   public synchronized void revoke() {
     if (revoked) return;
-    for (DistributeMongoSignalBase signal : signalList.values()) signal.close();
+    for (DistributeMongoSignalBase<?> signal : signalList.values()) signal.close();
     this.doRevoke();
     revoked = true;
   }
@@ -72,7 +68,7 @@ final class LeaseImp extends Lease {
   }
 
   private synchronized void doRevoke() {
-    DeleteResult deleteResult = collection.deleteOne(eq("_id", this.leaseID));
+    DeleteResult deleteResult = collection.deleteOne(eq("_id", this.id));
     System.out.println(deleteResult);
   }
 

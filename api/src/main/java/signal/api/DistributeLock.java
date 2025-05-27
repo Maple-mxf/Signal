@@ -14,8 +14,8 @@ public interface DistributeLock extends DistributeSignal {
    * @throws InterruptedException 调用lock操作的线程进入{@link
    *     java.lang.Thread.State#WAITING}状态，如果主线程被kill，此时会抛出此异常
    */
-  default void lock() throws InterruptedException, SignalException {
-    tryLock(-1L, TimeUnit.NANOSECONDS);
+  default boolean tryLock() throws InterruptedException, SignalException {
+    return tryLock(-1L, TimeUnit.NANOSECONDS);
   }
 
   /**

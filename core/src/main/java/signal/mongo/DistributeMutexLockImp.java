@@ -112,7 +112,7 @@ public final class DistributeMutexLockImp extends DistributeMongoSignalBase<Mute
 
   private MutexLockOwnerDocument buildCurrentOwner(int enterCount) {
     return new MutexLockOwnerDocument(
-        getCurrentHostname(), lease.getLeaseID(), getCurrentThreadName(), enterCount);
+        getCurrentHostname(), lease.getId(), getCurrentThreadName(), enterCount);
   }
 
   private record TryLockTxnResponse(boolean tryLockSuccess, boolean retryable) {}
@@ -361,7 +361,7 @@ public final class DistributeMutexLockImp extends DistributeMongoSignalBase<Mute
         (session, coll) -> {
           MutexLockDocument mutex =
               coll.find(
-                      session, and(eq("_id", this.getKey()), eq("owner.lease", lease.getLeaseID())))
+                      session, and(eq("_id", this.getKey()), eq("owner.lease", lease.getId())))
                   .first();
           if (mutex == null) return null;
           DeleteResult deleteResult =

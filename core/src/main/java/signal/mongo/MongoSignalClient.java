@@ -204,7 +204,7 @@ public class MongoSignalClient implements SignalClient {
           leaseWrapperRWLock.readLock().lock();
           try {
             leaseWrapperList.stream()
-                .filter(w -> leaseIdList.contains(w.lease.getLeaseID()))
+                .filter(w -> leaseIdList.contains(w.lease.getId()))
                 .forEach(w -> w.lease.postScopedEvent(scopedEvent));
           } finally {
             leaseWrapperRWLock.readLock().unlock();
@@ -464,7 +464,7 @@ public class MongoSignalClient implements SignalClient {
               .map(
                   t ->
                       new UpdateOneModel<Document>(
-                          eq("_id", t.lease.getLeaseID()), set("expireAt", now.plusSeconds(32L))))
+                          eq("_id", t.lease.getId()), set("expireAt", now.plusSeconds(32L))))
               .toList();
       BulkWriteResult bulkWriteResult =
           db.getCollection(LEASE_NAMED)
@@ -473,7 +473,7 @@ public class MongoSignalClient implements SignalClient {
       if (LOGGER.isDebugEnabled()) {
         LOGGER.debug(
             "TTL Lease success. LeaseIdList = [ {} ]. bulkWriteResult = {} ",
-            ttlLeaseList.stream().map(t -> t.lease.getLeaseID()).collect(joining(",")),
+            ttlLeaseList.stream().map(t -> t.lease.getId()).collect(joining(",")),
             bulkWriteResult);
       }
       for (LeaseWrapper wrapper : ttlLeaseList) wrapper.nextTTLTime = now.plusSeconds(16);
@@ -504,12 +504,10 @@ public class MongoSignalClient implements SignalClient {
 
           var leaseWrappers = new ArrayList<>(leaseWrapperList);
           Optional<LeaseWrapper> optional =
-              leaseWrappers.stream()
-                  .filter(t -> t.lease.getLeaseID().equals(bind.leaseID))
-                  .findFirst();
+              leaseWrappers.stream().filter(t -> t.lease.getId().equals(bind.leaseID)).findFirst();
           if (optional.isEmpty()) continue;
 
-          LOGGER.debug("Expire lease[ {} ]", optional.get().lease.getLeaseID());
+          LOGGER.debug("Expire lease[ {} ]", optional.get().lease.getId());
           leaseWrapperRWLock.writeLock().lock();
 
           try {
@@ -589,7 +587,7 @@ public class MongoSignalClient implements SignalClient {
   private void removeLeaseWrapper(String leaseID) {
     var leaseWrappers = new ArrayList<>(this.leaseWrapperList);
     Optional<LeaseWrapper> optional =
-        leaseWrappers.stream().filter(t -> t.lease.getLeaseID().equals(leaseID)).findFirst();
+        leaseWrappers.stream().filter(t -> t.lease.getId().equals(leaseID)).findFirst();
     if (optional.isEmpty()) return;
 
     leaseWrapperRWLock.writeLock().lock();
