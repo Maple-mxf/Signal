@@ -110,11 +110,9 @@ public final class DistributeReadWriteLockImp extends DistributeMongoSignalBase<
   @Keep
   @GuardedBy("varHandle")
   @VisibleForTesting
-  private final StatefulVar<LockStateObject> state;
+  private StatefulVar<LockStateObject> state;
 
-  private int i = 1;
   private final VarHandle varHandle;
-  private final VarHandle varHandle2;
 
   private final EventBus eventBus;
 
@@ -127,13 +125,11 @@ public final class DistributeReadWriteLockImp extends DistributeMongoSignalBase<
     super(lease, key, mongoClient, db, READ_WRITE_LOCK_NAMED);
 
     this.state = new StatefulVar<>(null);
+
     try {
       varHandle =
           MethodHandles.lookup()
               .findVarHandle(DistributeReadWriteLockImp.class, "state", StatefulVar.class);
-      varHandle2 =
-              MethodHandles.lookup()
-                      .findVarHandle(DistributeReadWriteLockImp.class, "i", int.class);
 
     } catch (NoSuchFieldException | IllegalAccessException e) {
       throw new IllegalStateException(e);
@@ -560,14 +556,13 @@ public final class DistributeReadWriteLockImp extends DistributeMongoSignalBase<
   }
 
   public void exchange() {
-     int currLockState =
-        (int) varHandle2.getAcquire(DistributeReadWriteLockImp.this);
-
-
-    varHandle2.compareAndExchangeRelease(
+    @SuppressWarnings("unchecked")
+    StatefulVar<LockStateObject> currLockState =
+            (StatefulVar<LockStateObject>) varHandle.getAcquire(DistributeReadWriteLockImp.this);
+    varHandle.compareAndExchangeRelease(
             DistributeReadWriteLockImp.this,
             currLockState,
-            22);
+            new StatefulVar<>(null));
   }
 
   @DoNotCall
