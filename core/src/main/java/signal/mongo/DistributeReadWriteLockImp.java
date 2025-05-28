@@ -103,18 +103,18 @@ public final class DistributeReadWriteLockImp extends DistributeMongoSignalBase<
     }
   }
 
-  // TODO 锁的可重入性
   private final DistributeReadLockImp readLockImp;
-  // TODO 锁的可重入性
   private final DistributeWriteLockImp writeLockImp;
 
   /** 当前锁的可用状态标识 */
   @Keep
-  @GuardedBy("modeVarHandle")
+  @GuardedBy("varHandle")
   @VisibleForTesting
-  final StatefulVar<LockStateObject> state;
+  private final StatefulVar<LockStateObject> state;
 
-  private final VarHandle modeVarHandle;
+  private int i = 1;
+  private final VarHandle varHandle;
+  private final VarHandle varHandle2;
 
   private final EventBus eventBus;
 
@@ -128,9 +128,13 @@ public final class DistributeReadWriteLockImp extends DistributeMongoSignalBase<
 
     this.state = new StatefulVar<>(null);
     try {
-      modeVarHandle =
+      varHandle =
           MethodHandles.lookup()
               .findVarHandle(DistributeReadWriteLockImp.class, "state", StatefulVar.class);
+      varHandle2 =
+              MethodHandles.lookup()
+                      .findVarHandle(DistributeReadWriteLockImp.class, "i", int.class);
+
     } catch (NoSuchFieldException | IllegalAccessException e) {
       throw new IllegalStateException(e);
     }
@@ -158,7 +162,7 @@ public final class DistributeReadWriteLockImp extends DistributeMongoSignalBase<
   private void safeUpdateModeIgnoreFailure(
       StatefulVar<LockStateObject> captureState, LockStateObject newObj) {
     Object oldObj =
-        modeVarHandle.compareAndExchangeRelease(
+        varHandle.compareAndExchangeRelease(
             DistributeReadWriteLockImp.this, captureState, new StatefulVar<>(newObj));
     log.log(
         Level.INFO,
@@ -258,7 +262,7 @@ public final class DistributeReadWriteLockImp extends DistributeMongoSignalBase<
     return (session, coll) -> {
       @SuppressWarnings("unchecked")
       StatefulVar<LockStateObject> state1 =
-          (StatefulVar<LockStateObject>) modeVarHandle.getAcquire(this);
+          (StatefulVar<LockStateObject>) varHandle.getAcquire(this);
 
       RWLockDocument lock1 = coll.find(session, eq("_id", this.getKey())).first();
       if (lock1 == null) {
@@ -343,7 +347,7 @@ public final class DistributeReadWriteLockImp extends DistributeMongoSignalBase<
                 @SuppressWarnings("unchecked")
                 StatefulVar<LockStateObject> sv =
                     ((StatefulVar<LockStateObject>)
-                        (modeVarHandle.getAcquire(DistributeReadWriteLockImp.this)));
+                        (varHandle.getAcquire(DistributeReadWriteLockImp.this)));
                 return parkPredicate.test(sv.value);
               },
               timed,
@@ -466,7 +470,7 @@ public final class DistributeReadWriteLockImp extends DistributeMongoSignalBase<
     return (session, coll) -> {
       @SuppressWarnings("unchecked")
       StatefulVar<LockStateObject> state1 =
-          (StatefulVar<LockStateObject>) modeVarHandle.getAcquire(this);
+          (StatefulVar<LockStateObject>) varHandle.getAcquire(this);
 
       RWLockDocument lock = coll.find(session, eq("_id", key)).first();
       if (lock == null || lock.mode() != mode || !lock.owners().contains(thisOwner)) {
@@ -555,6 +559,17 @@ public final class DistributeReadWriteLockImp extends DistributeMongoSignalBase<
     log.log(Level.INFO, "forceUnlockRsp: {0}", new Object[] {forceUnlockRsp});
   }
 
+  public void exchange() {
+     int currLockState =
+        (int) varHandle2.getAcquire(DistributeReadWriteLockImp.this);
+
+
+    varHandle2.compareAndExchangeRelease(
+            DistributeReadWriteLockImp.this,
+            currLockState,
+            22);
+  }
+
   @DoNotCall
   @Subscribe
   void awakeSuccessor(ChangeEvents.RWLockChangeEvent event) {
@@ -570,14 +585,14 @@ public final class DistributeReadWriteLockImp extends DistributeMongoSignalBase<
       // 执行之前先获取state的值，避免和lock函数并发更新state的值冲突
       @SuppressWarnings("unchecked")
       StatefulVar<LockStateObject> currLockState =
-          (StatefulVar<LockStateObject>) modeVarHandle.getAcquire(DistributeReadWriteLockImp.this);
+          (StatefulVar<LockStateObject>) varHandle.getAcquire(DistributeReadWriteLockImp.this);
       int currLockStateHashCode = identityHashCode(currLockState);
 
       // 当fullDocument为空时，对应的锁数据被删除的操作
       if (fullDocument == null || owners.isEmpty()) {
         if (currLockStateHashCode
             == identityHashCode(
-                modeVarHandle.compareAndExchangeRelease(
+                varHandle.compareAndExchangeRelease(
                     DistributeReadWriteLockImp.this,
                     currLockState,
                     new StatefulVar<LockStateObject>(null)))) {
@@ -607,7 +622,7 @@ public final class DistributeReadWriteLockImp extends DistributeMongoSignalBase<
 
       if (currLockStateHashCode
           == identityHashCode(
-              modeVarHandle.compareAndExchangeRelease(
+              varHandle.compareAndExchangeRelease(
                   DistributeReadWriteLockImp.this,
                   currLockState,
                   new StatefulVar<>(new LockStateObject(mode, ownerHashCodeList))))) {

@@ -6,9 +6,17 @@ import java.time.ZonedDateTime;
 import java.time.format.DateTimeFormatter;
 import org.junit.After;
 import org.junit.Before;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import signal.api.Lease;
+import signal.api.LeaseCreateConfig;
 
-public class BaseResourceSetup {
+public class Base {
   MongoSignalClient signalClient;
+
+  Lease lease;
+
+  Logger log = LoggerFactory.getLogger("Signal");
 
   public static String now() {
     ZonedDateTime now = Instant.now().atZone(ZoneId.of("GMT"));
@@ -17,15 +25,15 @@ public class BaseResourceSetup {
 
   @Before
   public void setup() {
-
     this.signalClient = MongoSignalClient.getInstance("mongodb://127.0.0.1:5707/signal");
+    this.lease = signalClient.grantLease(new LeaseCreateConfig());
     doSetup();
   }
 
   @After
   public void closeResource() {
-    signalClient.close();
     doCloseResource();
+    signalClient.close();
   }
 
   public void doSetup() {}

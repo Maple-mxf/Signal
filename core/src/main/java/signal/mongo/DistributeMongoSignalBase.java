@@ -38,12 +38,13 @@ abstract class DistributeMongoSignalBase<Doc> extends DistributeSignalBase {
   /** Command Executor */
   protected final CommandExecutor<Doc> commandExecutor;
 
+  @SuppressWarnings("unchecked")
   public DistributeMongoSignalBase(
       Lease lease, String key, MongoClient mongoClient, MongoDatabase db, String collectionName) {
     super(lease, key);
     this.closed = false;
     this.mongoClient = mongoClient;
-    this.documentTypeToken = new TypeToken<>() {};
+    this.documentTypeToken = new TypeToken<>(getClass()) {};
     this.collection =
         (MongoCollection<Doc>) db.getCollection(collectionName, documentTypeToken.getRawType());
     this.commandExecutor = new CommandExecutor<Doc>(this, mongoClient, collection);

@@ -90,7 +90,6 @@ import org.bson.codecs.pojo.PojoCodecProvider;
 import org.bson.conversions.Bson;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import signal.api.DistributeMutexLock;
 import signal.api.Lease;
 import signal.api.LeaseCreateConfig;
 import signal.api.SignalClient;
@@ -481,18 +480,18 @@ public class MongoSignalClient implements SignalClient {
   private class CleanExpireSignalTask extends TimerTask {
     @Override
     public void run() {
-      DistributeMutexLock mutex = lease.getMutexLock("SignalClient-CleanExpireSignalTask");
-      try {
-        boolean locked = mutex.tryLock(10L, SECONDS);
-        if (!locked) return;
-        try {
-          doRun();
-        } finally {
-          mutex.unlock();
-        }
-      } catch (InterruptedException e) {
-        e.printStackTrace();
-      }
+//      DistributeMutexLock mutex = lease.getMutexLock("SignalClient-CleanExpireSignalTask");
+//      try {
+//        boolean locked = mutex.tryLock(10L, SECONDS);
+//        if (!locked) return;
+//        try {
+//          doRun();
+//        } finally {
+////          mutex.unlock();
+//        }
+//      } catch (InterruptedException e) {
+//        e.printStackTrace();
+//      }
     }
 
     private void doRun() {
@@ -617,7 +616,7 @@ public class MongoSignalClient implements SignalClient {
     BiFunction<ClientSession, MongoCollection<Document>, Void> command =
         (session, coll) -> {
           List<Document> documentList = new ArrayList<>(4);
-          coll.listIndexes(session).into(documentList);
+          coll.listIndexes( ).into(documentList);
           boolean indexPresent =
               documentList.stream()
                   .anyMatch(

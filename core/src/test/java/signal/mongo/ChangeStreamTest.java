@@ -13,9 +13,9 @@ import com.mongodb.client.model.Updates;
 import com.mongodb.client.model.changestream.FullDocument;
 import com.mongodb.client.result.UpdateResult;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import org.bson.Document;
-import org.bson.types.ObjectId;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
@@ -43,29 +43,32 @@ public class ChangeStreamTest {
         .watch(Document.class)
         .fullDocument(FullDocument.UPDATE_LOOKUP)
         .showExpandedEvents(true)
-        .forEach(streamDocument -> System.out.printf("%s %s   %n",
-                streamDocument.getExtraElements(),
-                streamDocument.toString()));
+        .forEach(
+            streamDocument ->
+                System.out.printf(
+                    "%s %s   %n", streamDocument.getExtraElements(), streamDocument.toString()));
   }
+
+  //   // 在Update场景下，com.mongodb.client.model.changestream.ChangeStreamDocument.getFullDocument空的场景是
+  //  // 在一个事务内部，包含A和B两个操作(A和B顺序执行)
+  //  //    A：修改 id = '123' 的数据
+  //  //    B：删除 id = '123' 的数据
+  //  // 以上操作会导致MongoDB ChangeStream出现ChangeStreamDocument.getFullDocument()的返回值为NULL
+  //  // 如果一个事务中包含A和B两个写操作，如果事务运行过程中出现异常，则这里的changestream不会监听到任何变更
 
   @Test
   public void testWatchTransactionChange() throws InterruptedException {
-
-    // 集合监听
+    CountDownLatch countDownLatch = new CountDownLatch(1);
     Runnable watchTask =
         () -> {
+          countDownLatch.countDown();
           db.getCollection("student")
               .watch(Document.class)
-              .fullDocument(FullDocument.UPDATE_LOOKUP)
-              .forEach(
-                  streamDocument -> {
-                    System.out.printf(
-                        "FullDocument = %s Time = %d %n",
-                        streamDocument.getFullDocument(), System.nanoTime());
-                  });
+              .showExpandedEvents(true)
+              .forEach(sd -> System.out.printf("  SD = %s   %n", sd));
         };
     CompletableFuture.runAsync(watchTask);
-
+    countDownLatch.await();
     Runnable updateInTxnTask =
         () -> {
           MongoCollection<Document> coll = db.getCollection("student");
@@ -75,22 +78,19 @@ public class ChangeStreamTest {
                     () -> {
                       UpdateResult updateResult =
                           coll.updateOne(
-                              session,
-                              eq("_id", new ObjectId("6776301ae26fa14481fc0421")),
-                              Updates.set("desc", "desc111111"));
-
+                              session, eq("_id", 3), Updates.set("name", "desc1112222111"));
                       UpdateResult updateResult2 =
                           coll.updateOne(
-                              session,
-                              eq("_id", new ObjectId("6776301ae26fa14481fc0421")),
-                              Updates.set("desc", "desc222222"));
-
-                      throw new RuntimeException("xxx");
+                              session, eq("_id", 3), Updates.set("name", "desc22222233333"));
+                      coll.deleteOne(session, eq("_id", 3));
+                      return true;
                     },
                 TRANSACTION_OPTIONS);
+          } finally {
+            System.err.println("事务结束");
           }
         };
     CompletableFuture.runAsync(updateInTxnTask);
-    TimeUnit.SECONDS.sleep(2L);
+    TimeUnit.SECONDS.sleep(10L);
   }
 }
