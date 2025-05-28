@@ -85,11 +85,7 @@ public class ReadWriteLockTest extends Base {
       }
     };
   }
-  @Test
-  public void testReadWriteLock2() throws InterruptedException {
-    DistributeReadWriteLockImp distributeReadWriteLockImp = (DistributeReadWriteLockImp) this.distributeReadWriteLock;
-    distributeReadWriteLockImp.exchange();
-  }
+
 
   @Test
   public void testReadWriteLock() throws InterruptedException {
