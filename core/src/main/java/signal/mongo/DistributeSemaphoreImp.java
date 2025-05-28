@@ -436,8 +436,8 @@ public class DistributeSemaphoreImp extends DistributeMongoSignalBase<SemaphoreD
    */
   @DoNotCall
   @Subscribe
-  final void awakeSuccessor(ChangeStreamEvents.SemaphoreChangeAndRemovedEvent event) {
-    if (!this.getKey().equals(event.semaphoreKey()) || this.permits() != event.permits()) return;
+  final void awakeSuccessor(ChangeEvents.SemaphoreChangeEvent event) {
+    if (!this.getKey().equals(event.key())  ) return;
 
     Next:
     for (; ; ) {

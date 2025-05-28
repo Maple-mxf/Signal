@@ -27,13 +27,25 @@ public class ChangeStreamTest {
 
   @Before
   public void setup() {
-    client = MongoClients.create("mongodb://127.0.0.1:27017");
+    client = MongoClients.create("mongodb://127.0.0.1:5707");
     db = client.getDatabase("signal");
   }
 
   @After
   public void after() {
     client.close();
+  }
+
+  @Test
+  public void testWatchTransactionChange2() throws InterruptedException {
+    // 集合监听
+    db.getCollection("student")
+        .watch(Document.class)
+        .fullDocument(FullDocument.UPDATE_LOOKUP)
+        .showExpandedEvents(true)
+        .forEach(streamDocument -> System.out.printf("%s %s   %n",
+                streamDocument.getExtraElements(),
+                streamDocument.toString()));
   }
 
   @Test
@@ -59,25 +71,22 @@ public class ChangeStreamTest {
           MongoCollection<Document> coll = db.getCollection("student");
           try (ClientSession session = client.startSession()) {
             session.withTransaction(
-                new TransactionBody<Boolean>() {
-                  @Override
-                  public Boolean execute() {
-                    UpdateResult updateResult =
-                        coll.updateOne(
-                            session,
-                            eq("_id", new ObjectId("6776301ae26fa14481fc0421")),
-                            Updates.set("desc", "desc111111"));
+                (TransactionBody<Boolean>)
+                    () -> {
+                      UpdateResult updateResult =
+                          coll.updateOne(
+                              session,
+                              eq("_id", new ObjectId("6776301ae26fa14481fc0421")),
+                              Updates.set("desc", "desc111111"));
 
-                    UpdateResult updateResult2 =
-                        coll.updateOne(
-                            session,
-                            eq("_id", new ObjectId("6776301ae26fa14481fc0421")),
-                            Updates.set("desc", "desc222222"));
+                      UpdateResult updateResult2 =
+                          coll.updateOne(
+                              session,
+                              eq("_id", new ObjectId("6776301ae26fa14481fc0421")),
+                              Updates.set("desc", "desc222222"));
 
-
-                    throw new RuntimeException("xxx");
-                  }
-                },
+                      throw new RuntimeException("xxx");
+                    },
                 TRANSACTION_OPTIONS);
           }
         };

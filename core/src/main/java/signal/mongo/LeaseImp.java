@@ -131,6 +131,11 @@ final class LeaseImp extends Lease {
                     this, key, client, db, participants, leaseScopedEventBus));
   }
 
+  @Override
+  public boolean containSignal(String key) {
+    return signalList.containsKey(key);
+  }
+
   private void checkTypesafe(String key, Class<? extends DistributeMongoSignalBase<?>> type) {
     DistributeMongoSignalBase<?> signal = signalList.get(key);
     if (signal == null) return;

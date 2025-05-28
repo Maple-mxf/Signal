@@ -238,8 +238,8 @@ public final class DistributeBarrierImp extends DistributeMongoSignalBase<Barrie
 
   @DoNotCall
   @Subscribe
-  void awakeAll(ChangeStreamEvents.BarrierRemovedEvent event) {
-    if (!this.getKey().equals(event.barrierKey())) return;
+  void awakeAll(ChangeEvents.BarrierChangeEvent event) {
+    if (!this.getKey().equals(event.key())) return;
     Next:
     for (; ; ) {
       StatefulVar<Boolean> currState = (StatefulVar<Boolean>) varHandle.getAcquire(this);

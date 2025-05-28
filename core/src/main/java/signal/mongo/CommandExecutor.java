@@ -38,17 +38,14 @@ import signal.api.SignalException;
 final class CommandExecutor<Doc> {
   private final MongoClient mongoClient;
   private final MongoCollection<Doc> collection;
-  private final DistributeMongoSignalBase<Doc> signal;
+  private final Object lockObj;
 
   public static final String TRANSACTION_TOO_LARGE_ERROR_LABEL = "TransactionTooLargeForCache";
 
-  CommandExecutor(
-      DistributeMongoSignalBase<Doc> signal,
-      MongoClient mongoClient,
-      MongoCollection<Doc> collection) {
+  CommandExecutor(Object lockObj, MongoClient mongoClient, MongoCollection<Doc> collection) {
     this.mongoClient = mongoClient;
     this.collection = collection;
-    this.signal = signal;
+    this.lockObj = lockObj;
   }
 
   <T> BiFunction<MongoException, MongoErrorCode, CommandResponse<T>> defaultDBErrorHandlePolicy(
@@ -144,7 +141,7 @@ final class CommandExecutor<Doc> {
       @Nullable Function<Throwable, CommandResponse<T>> unexpectedErrorHandlePolicy) {
 
     // 在单个进程内部 顺序执行事务操作 避免CPU飙升
-    synchronized (signal) {
+    synchronized (lockObj) {
       try (ClientSession session = mongoClient.startSession()) {
         T commandBody =
             session.withTransaction(() -> command.apply(session, collection), TRANSACTION_OPTIONS);

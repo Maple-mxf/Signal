@@ -1,6 +1,6 @@
 [versions]
 guava = "33.3.1-jre"
-mongo-driver = "5.2.1"
+mongo-driver = "5.5.0"
 autovalue = "1.11.0"
 autoservice = "1.1.1"
 failsafe = "3.3.2"

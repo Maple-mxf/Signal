@@ -79,4 +79,6 @@ public abstract class Lease {
    * @return getDoubleBarrier
    */
   public abstract DistributeDoubleBarrier getDoubleBarrier(String key, int participants);
+
+  public abstract boolean containSignal(String key);
 }

@@ -126,7 +126,7 @@ public final class DistributeMutexLockImp extends DistributeMongoSignalBase<Mute
    * <p>第一种情况：tryLock 先更新了{@link DistributeMutexLockImp#lockOwner}的值，lockOwner != null, 线程成功挂起
    *
    * <p>第二种情况：{@link
-   * DistributeMutexLockImp#awakeHead(ChangeStreamEvents.MutexLockChangeAndRemoveEvent)} 先更新了{@link
+   * DistributeMutexLockImp#awakeHead(ChangeEvents.MutexLockChangeEvent)} 先更新了{@link
    * DistributeMutexLockImp#lockOwner} 的值，lockOwner != null, TryLock的线程更新{@link
    * DistributeMutexLockImp#lockOwner}失败，重新进入TryLock进程
    *
@@ -314,8 +314,8 @@ public final class DistributeMutexLockImp extends DistributeMongoSignalBase<Mute
 
   @DoNotCall
   @Subscribe
-  void awakeHead(ChangeStreamEvents.MutexLockChangeAndRemoveEvent event) {
-    if (!event.lockKey().equals(this.getKey())) return;
+  void awakeHead(ChangeEvents.MutexLockChangeEvent event) {
+    if (!event.key().equals(this.getKey())) return;
     Next:
     for (; ; ) {
       @SuppressWarnings("unchecked")

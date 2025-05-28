@@ -1,6 +1,7 @@
 package signal.mongo;
 
 import static com.google.common.collect.Lists.transform;
+import static com.mongodb.MongoClientSettings.getDefaultCodecRegistry;
 import static com.mongodb.client.model.Aggregates.match;
 import static com.mongodb.client.model.Aggregates.project;
 import static com.mongodb.client.model.Aggregates.unwind;
@@ -15,17 +16,17 @@ import static com.mongodb.client.model.Projections.include;
 import static com.mongodb.client.model.Updates.pullByFilter;
 import static com.mongodb.client.model.Updates.set;
 import static com.mongodb.client.model.changestream.FullDocument.UPDATE_LOOKUP;
-import static com.mongodb.client.model.changestream.FullDocumentBeforeChange.WHEN_AVAILABLE;
-import static java.util.Collections.emptyList;
+import static com.mongodb.client.model.changestream.FullDocumentBeforeChange.OFF;
 import static java.util.Collections.singletonList;
 import static java.util.Optional.ofNullable;
 import static java.util.concurrent.TimeUnit.MILLISECONDS;
 import static java.util.concurrent.TimeUnit.SECONDS;
 import static java.util.stream.Collectors.groupingBy;
 import static java.util.stream.Collectors.joining;
-import static java.util.stream.Collectors.toMap;
 import static java.util.stream.Collectors.toSet;
 import static java.util.stream.StreamSupport.stream;
+import static org.bson.codecs.configuration.CodecRegistries.fromProviders;
+import static org.bson.codecs.configuration.CodecRegistries.fromRegistries;
 import static signal.mongo.CollectionNamed.BARRIER_NAMED;
 import static signal.mongo.CollectionNamed.COUNT_DOWN_LATCH_NAMED;
 import static signal.mongo.CollectionNamed.DOUBLE_BARRIER_NAMED;
@@ -33,6 +34,8 @@ import static signal.mongo.CollectionNamed.LEASE_NAMED;
 import static signal.mongo.CollectionNamed.MUTEX_LOCK_NAMED;
 import static signal.mongo.CollectionNamed.READ_WRITE_LOCK_NAMED;
 import static signal.mongo.CollectionNamed.SEMAPHORE_NAMED;
+import static signal.mongo.MongoErrorCode.NO_SUCH_TRANSACTION;
+import static signal.mongo.MongoErrorCode.WRITE_CONFLICT;
 import static signal.mongo.Utils.isBitSet;
 
 import com.google.auto.service.AutoService;
@@ -40,11 +43,14 @@ import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.ImmutableMap;
 import com.google.errorprone.annotations.Keep;
 import com.google.errorprone.annotations.ThreadSafe;
+import com.mongodb.ConnectionString;
+import com.mongodb.MongoClientSettings;
 import com.mongodb.MongoNamespace;
 import com.mongodb.bulk.BulkWriteResult;
 import com.mongodb.client.ChangeStreamIterable;
 import com.mongodb.client.ClientSession;
 import com.mongodb.client.MongoClient;
+import com.mongodb.client.MongoClients;
 import com.mongodb.client.MongoCollection;
 import com.mongodb.client.MongoDatabase;
 import com.mongodb.client.model.Aggregates;
@@ -74,11 +80,13 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.function.BiConsumer;
+import java.util.function.BiFunction;
 import java.util.function.Consumer;
 import java.util.function.Function;
 import org.bson.BsonString;
 import org.bson.BsonType;
 import org.bson.Document;
+import org.bson.codecs.pojo.PojoCodecProvider;
 import org.bson.conversions.Bson;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -109,21 +117,21 @@ public class MongoSignalClient implements SignalClient {
   private final Timer timer;
 
   private final List<LeaseWrapper> leaseWrapperList;
-  private final ReentrantReadWriteLock leaseWrapperRWLock;
+  private final ReentrantReadWriteLock rwLocker;
   private final ExecutorService executorService;
 
   // 代表删除操作 第0位 == 1代表删除操作
-  private static final int DELETE_OP = 0b001;
+  private static final int DELETE = 0b001;
   // 代表更新操作 第1位 == 1代表修改操作
-  private static final int UPDATE_OP = 0b010;
+  private static final int UPDATE = 0b010;
   // 代表插入操作 第2位 == 1代表插入操作
-  private static final int INSERT_OP = 0b100;
+  private static final int INSERT = 0b100;
 
   private static final ImmutableMap<OperationType, Integer> OP_MAPPING =
       ImmutableMap.of(
-          OperationType.INSERT, INSERT_OP,
-          OperationType.UPDATE, UPDATE_OP,
-          OperationType.DELETE, DELETE_OP);
+          OperationType.INSERT, INSERT,
+          OperationType.UPDATE, UPDATE,
+          OperationType.DELETE, DELETE);
 
   record ChangeEventsHandler(
       String signalNamed, int ops, Consumer<ChangeStreamDocument<Document>> handler) {}
@@ -135,13 +143,27 @@ public class MongoSignalClient implements SignalClient {
   private final Lease lease;
 
   @SuppressWarnings("FutureReturnValueIgnored")
-  private MongoSignalClient(MongoClient mongoClient, String dbNamed) {
-    this.mongoClient = mongoClient;
-    this.db = mongoClient.getDatabase(dbNamed);
-    this.modCollDefinitions();
+  private MongoSignalClient(String connectionString) {
+    ConnectionString connectionStringObj = new ConnectionString(connectionString);
+    if (connectionStringObj.getDatabase() == null || connectionStringObj.getDatabase().isEmpty())
+      throw new IllegalArgumentException();
 
+    this.mongoClient =
+        MongoClients.create(
+            MongoClientSettings.builder()
+                .applyConnectionString(connectionStringObj)
+                //                .applyToConnectionPoolSettings(
+                //                    builder -> builder.maxSize(16).minSize(1).maxConnecting(4))
+                .codecRegistry(
+                    fromRegistries(
+                        getDefaultCodecRegistry(),
+                        fromProviders(PojoCodecProvider.builder().automatic(true).build())))
+                .build());
+
+    this.db = mongoClient.getDatabase(connectionStringObj.getDatabase());
+    this.modCollDefinitions();
     this.leaseWrapperList = new ArrayList<>(8);
-    this.leaseWrapperRWLock = new ReentrantReadWriteLock(true);
+    this.rwLocker = new ReentrantReadWriteLock(true);
     this.changeEventsDispatcher = initChangeEventsDispatcher();
 
     this.executorService = Executors.newFixedThreadPool(8);
@@ -159,13 +181,12 @@ public class MongoSignalClient implements SignalClient {
   /**
    * Get Single Instance
    *
-   * @param client client
-   * @param dbNamed dbNamed
+   * @param connectionString mongodb connection string
    * @return MongoSignalClient instance
    */
-  public static synchronized MongoSignalClient getInstance(MongoClient client, String dbNamed) {
+  public static synchronized MongoSignalClient getInstance(String connectionString) {
     if (INSTANCE != null) return INSTANCE;
-    INSTANCE = new MongoSignalClient(client, dbNamed);
+    INSTANCE = new MongoSignalClient(connectionString);
     return INSTANCE;
   }
 
@@ -174,9 +195,9 @@ public class MongoSignalClient implements SignalClient {
   ChangeEventsHandler getDispatcherHandler(String signalNamed, int op) {
     for (ChangeEventsHandler handler : changeEventsDispatcher) {
       if (!handler.signalNamed.equals(signalNamed)) continue;
-      if ((DELETE_OP == op && isBitSet(handler.ops, 0))
-          || (UPDATE_OP == op && isBitSet(handler.ops, 1))
-          || (INSERT_OP == op && isBitSet(handler.ops, 2))) {
+      if ((DELETE == op && isBitSet(handler.ops, 0))
+          || (UPDATE == op && isBitSet(handler.ops, 1))
+          || (INSERT == op && isBitSet(handler.ops, 2))) {
         return handler;
       }
     }
@@ -190,43 +211,34 @@ public class MongoSignalClient implements SignalClient {
   // 以上操作会导致MongoDB ChangeStream出现ChangeStreamDocument.getFullDocument()的返回值为NULL
   // 如果一个事务中包含A和B两个写操作，如果事务运行过程中出现异常，则这里的changestream不会监听到任何变更
   private ChangeEventsHandler[] initChangeEventsDispatcher() {
-    Function<ChangeStreamDocument<Document>, String> getKeyFn =
+    Function<ChangeStreamDocument<Document>, String> mapKeyFunc =
         streamDocument ->
             ofNullable(streamDocument.getDocumentKey())
                 .map(t -> t.getString("_id"))
                 .map(BsonString::getValue)
                 .orElse(null);
 
-    Function<Document, Collection<String>> listLeaseIdFn =
-        fullDocument ->
-            ofNullable(fullDocument)
-                .map(t -> t.getList("o", Document.class))
-                .map(t -> t.stream().map(e -> e.getString("lease")).toList())
-                .orElse(emptyList());
-
-    BiConsumer<Object, Collection<String>> postSignalScopedEventFn =
-        (scopedEvent, leaseIdList) -> {
-          if (leaseIdList.isEmpty()) return;
-          leaseWrapperRWLock.readLock().lock();
+    BiConsumer<String, Object> postSignalEventFunc =
+        (key, event) -> {
+          rwLocker.readLock().lock();
           try {
-            leaseWrapperList.stream()
-                .filter(w -> leaseIdList.contains(w.lease.getId()))
-                .forEach(w -> w.lease.postScopedEvent(scopedEvent));
+            leaseWrapperList.forEach(
+                lw -> {
+                  if (lw.lease.containSignal(key)) {
+                    lw.lease.postScopedEvent(event);
+                  }
+                });
           } finally {
-            leaseWrapperRWLock.readLock().unlock();
+            rwLocker.readLock().unlock();
           }
         };
 
     BiConsumer<ChangeStreamDocument<Document>, Function<ChangeStreamDocument<Document>, Object>>
         eventHandlerFn =
-            (streamDocument, eventProducer) -> {
-              List<String> leaseIdList = new ArrayList<>();
-              leaseIdList.addAll(listLeaseIdFn.apply(streamDocument.getFullDocument()));
-              leaseIdList.addAll(listLeaseIdFn.apply(streamDocument.getFullDocumentBeforeChange()));
-              if (leaseIdList.isEmpty()) return;
-
-              Object scopedEvent = eventProducer.apply(streamDocument);
-              postSignalScopedEventFn.accept(scopedEvent, leaseIdList);
+            (sd, ep) -> {
+              if (sd.getDocumentKey() == null) return;
+              postSignalEventFunc.accept(
+                  sd.getDocumentKey().getString("_id").getValue(), ep.apply(sd));
             };
 
     return new ChangeEventsHandler[] {
@@ -234,59 +246,42 @@ public class MongoSignalClient implements SignalClient {
       // 监听Lease的删除事件
       new ChangeEventsHandler(
           LEASE_NAMED,
-          DELETE_OP,
-          streamDocument -> {
-            String leaseID = getKeyFn.apply(streamDocument);
-            if (leaseID == null) {
-              LOGGER.error("Document key nil.");
-              return;
-            }
-            removeLeaseWrapper(leaseID);
+          DELETE,
+          sd -> {
+            if (sd.getDocumentKey() == null) return;
+            removeLeaseWrapper(sd.getDocumentKey().getString("_id").getValue());
           }),
 
       // 监听barrier的删除事件
       new ChangeEventsHandler(
           BARRIER_NAMED,
-          DELETE_OP,
-          streamDocument ->
+          DELETE,
+          sd ->
               eventHandlerFn.accept(
-                  streamDocument,
-                  t ->
-                      new ChangeStreamEvents.BarrierRemovedEvent(
-                          getKeyFn.apply(t), t.getFullDocumentBeforeChange()))),
+                  sd, t -> new ChangeEvents.BarrierChangeEvent(mapKeyFunc.apply(t)))),
 
       // 监听double barrier的修改事件
       new ChangeEventsHandler(
           DOUBLE_BARRIER_NAMED,
-          UPDATE_OP,
-          streamDocument ->
+          UPDATE,
+          sd ->
               eventHandlerFn.accept(
-                  streamDocument,
-                  t -> {
-                    int p =
-                        streamDocument.getFullDocument() == null
-                            ? t.getFullDocumentBeforeChange().getInteger("p")
-                            : t.getFullDocument().getInteger("p");
-                    ChangeStreamEvents.DoubleBarrierChangeEvent event =
-                        new ChangeStreamEvents.DoubleBarrierChangeEvent(
-                            t.getDocumentKey().getString("_id").getValue(), p, t.getFullDocument());
-                    return event;
-                  })),
+                  sd,
+                  t ->
+                      new ChangeEvents.DoubleBarrierChangeEvent(
+                          t.getDocumentKey().getString("_id").getValue(), t.getFullDocument()))),
 
       // 监听countdownlatch的修改事件
       new ChangeEventsHandler(
           COUNT_DOWN_LATCH_NAMED,
-          UPDATE_OP | INSERT_OP | DELETE_OP,
-          streamDocument -> {
-            String cdlKey = getKeyFn.apply(streamDocument);
+          UPDATE | INSERT | DELETE,
+          sd -> {
+            String cdlKey = mapKeyFunc.apply(sd);
             eventHandlerFn.accept(
-                streamDocument,
+                sd,
                 t ->
-                    new ChangeStreamEvents.CountDownLatchChangeEvent(
+                    new ChangeEvents.CountDownLatchChangeEvent(
                         cdlKey,
-                        t.getFullDocument() == null
-                            ? t.getFullDocumentBeforeChange().getInteger("c")
-                            : t.getFullDocument().getInteger("c"),
                         t.getFullDocument() == null ? 0 : t.getFullDocument().getInteger("cc"),
                         t.getFullDocument()));
           }),
@@ -294,39 +289,34 @@ public class MongoSignalClient implements SignalClient {
       // 监听semaphore的修改和删除事件
       new ChangeEventsHandler(
           SEMAPHORE_NAMED,
-          UPDATE_OP | DELETE_OP,
-          streamDocument ->
+          UPDATE | DELETE,
+          sd ->
               eventHandlerFn.accept(
-                  streamDocument,
+                  sd,
                   t ->
-                      new ChangeStreamEvents.SemaphoreChangeAndRemovedEvent(
-                          getKeyFn.apply(t),
-                          t.getFullDocument() == null
-                              ? t.getFullDocumentBeforeChange().getInteger("p")
-                              : t.getFullDocument().getInteger("p"),
-                          t.getFullDocument()))),
+                      new ChangeEvents.SemaphoreChangeEvent(
+                          mapKeyFunc.apply(t), t.getFullDocument()))),
 
       // 监听read write lock的插入、修改、删除事件
       new ChangeEventsHandler(
           READ_WRITE_LOCK_NAMED,
-          INSERT_OP | UPDATE_OP | DELETE_OP,
-          streamDocument ->
+          INSERT | UPDATE | DELETE,
+          sd ->
               eventHandlerFn.accept(
-                  streamDocument,
+                  sd,
                   t ->
-                      new ChangeStreamEvents.ReadWriteLockChangeAndRemovedEvent(
-                          t.getDocumentKey().getString("_id").getValue(),
-                          streamDocument.getFullDocument()))),
+                      new ChangeEvents.RWLockChangeEvent(
+                          t.getDocumentKey().getString("_id").getValue(), sd.getFullDocument()))),
 
       // 监听mutex的删除或者修改事件
       new ChangeEventsHandler(
           MUTEX_LOCK_NAMED,
-          DELETE_OP | UPDATE_OP,
-          streamDocument ->
+          DELETE | UPDATE,
+          sd ->
               eventHandlerFn.accept(
-                  streamDocument,
+                  sd,
                   t ->
-                      new ChangeStreamEvents.MutexLockChangeAndRemoveEvent(
+                      new ChangeEvents.MutexLockChangeEvent(
                           t.getDocumentKey().getString("_id").getValue(), t.getFullDocument())))
     };
   }
@@ -376,19 +366,20 @@ public class MongoSignalClient implements SignalClient {
                               READ_WRITE_LOCK_NAMED,
                               SEMAPHORE_NAMED))))
               .fullDocument(UPDATE_LOOKUP)
-              .fullDocumentBeforeChange(WHEN_AVAILABLE)
-              .maxAwaitTime(50L, MILLISECONDS);
-      for (ChangeStreamDocument<Document> streamDocument : changeStream) {
-        MongoNamespace namespace = streamDocument.getNamespace();
-        if (namespace == null) continue;
+              .fullDocumentBeforeChange(OFF)
+              .showExpandedEvents(false)
+              .maxAwaitTime(3000L, MILLISECONDS);
+
+      for (ChangeStreamDocument<Document> sd : changeStream) {
+        MongoNamespace ns = sd.getNamespace();
+        if (ns == null) continue;
 
         Integer opCode;
         ChangeEventsHandler handler;
-        if ((opCode = OP_MAPPING.get(streamDocument.getOperationType())) == null
-            || (handler = getDispatcherHandler(namespace.getCollectionName(), opCode)) == null)
-          continue;
+        if ((opCode = OP_MAPPING.get(sd.getOperationType())) == null
+            || (handler = getDispatcherHandler(ns.getCollectionName(), opCode)) == null) continue;
         try {
-          handler.handler.accept(streamDocument);
+          handler.handler.accept(sd);
         } catch (Throwable error) {
           LOGGER
               .atError()
@@ -405,7 +396,7 @@ public class MongoSignalClient implements SignalClient {
     String id = now.format(DateTimeFormatter.ofPattern("ddHHmmssn"));
     LeaseImp lease = new LeaseImp(this.mongoClient, this.db, id);
 
-    leaseWrapperRWLock.writeLock().lock();
+    rwLocker.writeLock().lock();
     try {
       leaseWrapperList.add(new LeaseWrapper(lease, lease.getCreatedTime().plusSeconds(16)));
       if (LOGGER.isDebugEnabled()) {
@@ -413,7 +404,7 @@ public class MongoSignalClient implements SignalClient {
       }
       return lease;
     } finally {
-      leaseWrapperRWLock.writeLock().unlock();
+      rwLocker.writeLock().unlock();
     }
   }
 
@@ -433,7 +424,7 @@ public class MongoSignalClient implements SignalClient {
     if (LOGGER.isDebugEnabled()) {
       LOGGER.debug("Closing client resource.");
     }
-    leaseWrapperRWLock.writeLock().lock();
+    rwLocker.writeLock().lock();
     try {
       for (LeaseWrapper w : this.leaseWrapperList) {
         if (w.lease.isRevoked()) continue;
@@ -443,7 +434,7 @@ public class MongoSignalClient implements SignalClient {
       this.executorService.shutdownNow();
       this.leaseWrapperList.clear();
     } finally {
-      leaseWrapperRWLock.writeLock().unlock();
+      rwLocker.writeLock().unlock();
     }
   }
 
@@ -529,12 +520,12 @@ public class MongoSignalClient implements SignalClient {
           if (optional.isEmpty()) continue;
 
           LOGGER.debug("Expire lease[ {} ]", optional.get().lease.getId());
-          leaseWrapperRWLock.writeLock().lock();
+          rwLocker.writeLock().lock();
 
           try {
             leaseWrapperList.remove(optional.get());
           } finally {
-            leaseWrapperRWLock.writeLock().unlock();
+            rwLocker.writeLock().unlock();
           }
         }
 
@@ -605,79 +596,46 @@ public class MongoSignalClient implements SignalClient {
         .collect(toSet());
   }
 
-  private void removeLeaseWrapper(String leaseID) {
+  private void removeLeaseWrapper(String leaseId) {
     var leaseWrappers = new ArrayList<>(this.leaseWrapperList);
     Optional<LeaseWrapper> optional =
-        leaseWrappers.stream().filter(t -> t.lease.getId().equals(leaseID)).findFirst();
+        leaseWrappers.stream().filter(t -> t.lease.getId().equals(leaseId)).findFirst();
     if (optional.isEmpty()) return;
 
-    leaseWrapperRWLock.writeLock().lock();
+    rwLocker.writeLock().lock();
     try {
       leaseWrapperList.remove(optional.get());
     } finally {
-      leaseWrapperRWLock.writeLock().unlock();
+      rwLocker.writeLock().unlock();
     }
   }
 
   private synchronized void modCollDefinitions() {
-    Map<String, Document> presentCollections =
-        stream(db.listCollections().spliterator(), false)
-            .collect(toMap(t -> t.getString("name"), t -> t.get("options", Document.class)));
+    CommandExecutor<Document> commandExecutor =
+        new CommandExecutor<>(this, mongoClient, db.getCollection(LEASE_NAMED));
 
-    Consumer<String> modCollOptionsFn =
-        collNamed -> {
-          if (!presentCollections.containsKey(collNamed)) {
-            db.createCollection(
-                collNamed,
-                new CreateCollectionOptions()
-                    .changeStreamPreAndPostImagesOptions(
-                        new ChangeStreamPreAndPostImagesOptions(true)));
-            return;
-          }
-          boolean enableChangeStreamPreAndPostImages =
-              ofNullable(presentCollections.get(collNamed))
-                  .map(t -> t.get("changeStreamPreAndPostImages", Document.class))
-                  .map(t -> t.getBoolean("enabled", false))
-                  .orElse(false);
-          if (!enableChangeStreamPreAndPostImages) {
-            db.runCommand(
-                new Document("collMod", collNamed)
-                    .append("changeStreamPreAndPostImages", new Document("enabled", true)));
-          }
-        };
-
-    BiConsumer<String, Long> createTTLIndexFn =
-        (collNamed, expireSecond) -> {
-          MongoCollection<Document> collection = db.getCollection(collNamed);
-          collection.createIndex(
+    BiFunction<ClientSession, MongoCollection<Document>, Void> command =
+        (session, coll) -> {
+          List<Document> documentList = new ArrayList<>(4);
+          coll.listIndexes(session).into(documentList);
+          boolean indexPresent =
+              documentList.stream()
+                  .anyMatch(
+                      t -> {
+                        Document key = t.get("key", Document.class);
+                        return key.containsKey("expireAt") && t.containsKey("expireAfterSeconds");
+                      });
+          if (indexPresent) return null;
+          coll.createIndex(
+              session,
               Indexes.ascending("expireAt"),
-              new IndexOptions().expireAfter(expireSecond, SECONDS).name("_expireAt_"));
+              new IndexOptions().expireAfter(10L, SECONDS).name("_expireAt_"));
+          return null;
         };
 
-    if (presentCollections.containsKey(LEASE_NAMED)) {
-      MongoCollection<Document> collection = db.getCollection(LEASE_NAMED);
-      List<Document> indexDocList = stream(collection.listIndexes().spliterator(), false).toList();
-      boolean indexPresent =
-          indexDocList.stream()
-              .anyMatch(
-                  t -> {
-                    Document key = t.get("key", Document.class);
-                    return key.containsKey("expireAt") && t.containsKey("expireAfterSeconds");
-                  });
-      if (!indexPresent) createTTLIndexFn.accept(LEASE_NAMED, 10L);
-    } else {
-      createTTLIndexFn.accept(LEASE_NAMED, 10L);
-    }
-    var signalNamedList =
-        new String[] {
-          LEASE_NAMED,
-          BARRIER_NAMED,
-          DOUBLE_BARRIER_NAMED,
-          COUNT_DOWN_LATCH_NAMED,
-          MUTEX_LOCK_NAMED,
-          READ_WRITE_LOCK_NAMED,
-          SEMAPHORE_NAMED
-        };
-    for (String signalCollNamed : signalNamedList) modCollOptionsFn.accept(signalCollNamed);
+    Void unused =
+        commandExecutor.loopExecute(
+            command,
+            commandExecutor.defaultDBErrorHandlePolicy(WRITE_CONFLICT, NO_SUCH_TRANSACTION));
   }
 }

@@ -4,38 +4,34 @@ import com.mongodb.lang.NonNull;
 import com.mongodb.lang.Nullable;
 import org.bson.Document;
 
-interface ChangeStreamEvents {
-  record BarrierRemovedEvent(String barrierKey, Document beforeChangeDocument)
-      implements ChangeStreamEvents {}
+interface ChangeEvents {
+  record BarrierChangeEvent(String key) implements ChangeEvents {}
 
   record DoubleBarrierChangeEvent(
-      String doubleBarrierKey,
-      int participants,
+      String key,
       // 当对应删除操作时，fullDocument为空
-      Document fullDocument)
-      implements ChangeStreamEvents {}
+      @Nullable Document fullDocument)
+      implements ChangeEvents {}
 
   record CountDownLatchChangeEvent(
-      String cdlKey,
-      int c,
+      String key,
       int cc,
       // 当对应删除操作时，fullDocument为空
       Document fullDocument)
-      implements ChangeStreamEvents {}
+      implements ChangeEvents {}
 
-  record SemaphoreChangeAndRemovedEvent(
-      @NonNull String semaphoreKey,
-      int permits,
+  record SemaphoreChangeEvent(
+      @NonNull String key,
       // 当对应删除操作时，fullDocument为空
       Document fullDocument) {}
 
-  record ReadWriteLockChangeAndRemovedEvent(
-      @NonNull String lockKey,
+  record RWLockChangeEvent(
+      @NonNull String key,
       // 当对应删除操作时，fullDocument为空
       Document fullDocument) {}
 
-  record MutexLockChangeAndRemoveEvent(
-      @NonNull String lockKey,
+  record MutexLockChangeEvent(
+      @NonNull String key,
       // 当对应删除操作时，fullDocument为空
       @Nullable Document fullDocument) {}
 }

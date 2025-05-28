@@ -557,7 +557,7 @@ public final class DistributeReadWriteLockImp extends DistributeMongoSignalBase<
 
   @DoNotCall
   @Subscribe
-  void awakeSuccessor(ChangeStreamEvents.ReadWriteLockChangeAndRemovedEvent event) {
+  void awakeSuccessor(ChangeEvents.RWLockChangeEvent event) {
     Document fullDocument = event.fullDocument();
 
     List<Document> owners =

@@ -271,8 +271,8 @@ final class DistributeCountDownLatchImp extends DistributeMongoSignalBase<CountD
 
   @DoNotCall
   @Subscribe
-  void awakeAllSuccessor(ChangeStreamEvents.CountDownLatchChangeEvent event) {
-    if (!this.getKey().equals(event.cdlKey()) || this.count != event.c()) return;
+  void awakeAllSuccessor(ChangeEvents.CountDownLatchChangeEvent event) {
+    if (!this.getKey().equals(event.key())  ) return;
 
     Next:
     for (; ; ) {
