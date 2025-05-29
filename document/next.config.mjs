@@ -8,8 +8,8 @@ const repoName = "Signal";
 const config = {
     reactStrictMode: true,
     output: 'export',
-    basePath: `/${repoName}/`,
-    assetPrefix: `/${repoName}/`,
+    basePath: `/${repoName}`,
+    assetPrefix: `/${repoName}`,
 };
 
 export default withMDX(config);

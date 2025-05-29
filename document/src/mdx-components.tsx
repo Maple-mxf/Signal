@@ -8,7 +8,7 @@ import * as icons from 'lucide-react';
 import {CodeBlock, Pre} from 'fumadocs-ui/components/codeblock';
 import {Callout} from 'fumadocs-ui/components/callout';
 import {TypeTable} from 'fumadocs-ui/components/type-table';
-
+import {GithubInfo} from 'fumadocs-ui/components/github-info';
 
 // use this function to get MDX components, you will need it for rendering MDX
 export function getMDXComponents(components?: MDXComponents): MDXComponents {
@@ -29,5 +29,6 @@ export function getMDXComponents(components?: MDXComponents): MDXComponents {
         Accordions,
         Callout,
         ...components,
+        GithubInfo
     };
 }
