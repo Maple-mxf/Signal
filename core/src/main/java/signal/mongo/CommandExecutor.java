@@ -15,6 +15,8 @@ import java.util.concurrent.TimeUnit;
 import java.util.function.BiFunction;
 import java.util.function.Function;
 import java.util.function.Predicate;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import signal.api.SignalException;
 
 /**
@@ -40,6 +42,8 @@ final class CommandExecutor<Doc> {
   private final MongoCollection<Doc> collection;
   private final Object lockObj;
 
+  private final Logger log = LoggerFactory.getLogger("signal.core.CommandExecutor");
+
   public static final String TRANSACTION_TOO_LARGE_ERROR_LABEL = "TransactionTooLargeForCache";
 
   CommandExecutor(Object lockObj, MongoClient mongoClient, MongoCollection<Doc> collection) {
@@ -56,6 +60,11 @@ final class CommandExecutor<Doc> {
                 && ImmutableSet.copyOf(retryableCodes).contains(dbErrorCode),
             dbErrorCode,
             dbError);
+  }
+
+  @CheckReturnValue
+  <T> T loopExecute(@NonNull BiFunction<ClientSession, MongoCollection<Doc>, T> command) {
+    return loopExecute(command, null, null, t -> false);
   }
 
   @CheckReturnValue
@@ -143,18 +152,26 @@ final class CommandExecutor<Doc> {
     // 在单个进程内部 顺序执行事务操作 避免CPU飙升
     synchronized (lockObj) {
       try (ClientSession session = mongoClient.startSession()) {
-        System.err.println("execute LoopCommand");
+        if (log.isDebugEnabled()) {
+          log.debug("Execute transaction-command. {} ", lockObj);
+        }
         T commandBody =
             session.withTransaction(() -> command.apply(session, collection), TRANSACTION_OPTIONS);
         return CommandResponse.ok(commandBody);
       } catch (MongoException dbError) {
         MongoErrorCode errCode = MongoErrorCode.fromException(dbError);
-        System.err.println("execute LoopCommand MongoErrorCode : "  + errCode);
+        if (log.isDebugEnabled()) {
+          log.error("Execute transaction-command occur an txn error : {} ", errCode);
+        }
         return dbErrorHandlePolicy != null
             ? dbErrorHandlePolicy.apply(dbError, errCode)
             : CommandResponse.dbError(false, errCode, dbError);
       } catch (Throwable unexpectedError) {
-        System.err.println("execute LoopCommand unexpectedError : "  + unexpectedError.getMessage());
+
+        if (log.isDebugEnabled()) {
+          log.error("");
+        }
+
         return unexpectedErrorHandlePolicy != null
             ? unexpectedErrorHandlePolicy.apply(unexpectedError)
             : CommandResponse.unexpectedError(unexpectedError, false);

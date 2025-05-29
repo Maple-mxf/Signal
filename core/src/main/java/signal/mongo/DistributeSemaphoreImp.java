@@ -282,7 +282,7 @@ public class DistributeSemaphoreImp extends DistributeMongoSignalBase<SemaphoreD
           commandExecutor.loopExecute(
               command,
               commandExecutor.defaultDBErrorHandlePolicy(
-                      NO_SUCH_TRANSACTION, DUPLICATE_KEY, LOCK_FAILED),
+                  NO_SUCH_TRANSACTION, DUPLICATE_KEY, LOCK_FAILED),
               null,
               t -> !t.txnOk && t.retryable && !t.thrownError,
               timed,
@@ -402,8 +402,7 @@ public class DistributeSemaphoreImp extends DistributeMongoSignalBase<SemaphoreD
             DeleteResult deleteResult = coll.deleteOne(session, filter);
             return deleteResult.getDeletedCount() == 1L;
           }
-          var update =
-              combine(pull("owners", eq("lease", getLease().getId())), inc("version", 1));
+          var update = combine(pull("owners", eq("lease", getLease().getId())), inc("version", 1));
           return (sd = coll.findOneAndUpdate(session, filter, update)) != null
               && sd.version() == newVersion;
         };
@@ -416,6 +415,7 @@ public class DistributeSemaphoreImp extends DistributeMongoSignalBase<SemaphoreD
     }
   }
 
+  @SuppressWarnings("unchecked")
   private void doUnparkSuccessor() {
     lock.lock();
     try {
@@ -437,10 +437,11 @@ public class DistributeSemaphoreImp extends DistributeMongoSignalBase<SemaphoreD
   @DoNotCall
   @Subscribe
   final void awakeSuccessor(ChangeEvents.SemaphoreChangeEvent event) {
-    if (!this.getKey().equals(event.key())  ) return;
+    if (!this.getKey().equals(event.key())) return;
 
     Next:
     for (; ; ) {
+      @SuppressWarnings("unchecked")
       StatefulVar<Integer> currState = (StatefulVar<Integer>) varHandle.getAcquire(this);
       int currStateHashCode = identityHashCode(currState);
 
@@ -500,7 +501,7 @@ public class DistributeSemaphoreImp extends DistributeMongoSignalBase<SemaphoreD
     return commandExecutor.loopExecute(
         command,
         commandExecutor.defaultDBErrorHandlePolicy(
-                LOCK_BUSY, LOCK_FAILED, LOCK_TIMEOUT, NO_SUCH_TRANSACTION),
+            LOCK_BUSY, LOCK_FAILED, LOCK_TIMEOUT, NO_SUCH_TRANSACTION),
         null,
         t -> false);
   }

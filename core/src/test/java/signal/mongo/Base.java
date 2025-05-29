@@ -25,7 +25,7 @@ public class Base {
 
   @Before
   public void setup() {
-    this.signalClient = MongoSignalClient.getInstance("mongodb://127.0.0.1:5707/signal");
+    this.signalClient = MongoSignalClient.getInstance("mongodb://127.0.0.1:27017/signal");
     this.lease = signalClient.grantLease(new LeaseCreateConfig());
     doSetup();
   }

@@ -66,4 +66,6 @@ final class Utils {
   static String getCurrentHostname() {
     return Optional.ofNullable(System.getenv("HOSTNAME")).orElse("");
   }
+
+  public static void main(String[] args) {}
 }

@@ -27,7 +27,7 @@ public class ChangeStreamTest {
 
   @Before
   public void setup() {
-    client = MongoClients.create("mongodb://127.0.0.1:5707");
+    client = MongoClients.create("mongodb://127.0.0.1:27017/signal");
     db = client.getDatabase("signal");
   }
 
@@ -39,14 +39,17 @@ public class ChangeStreamTest {
   @Test
   public void testWatchTransactionChange2() throws InterruptedException {
     // 集合监听
-    db.getCollection("student")
+    db.getCollection("signal_rw_lock")
         .watch(Document.class)
         .fullDocument(FullDocument.UPDATE_LOOKUP)
         .showExpandedEvents(true)
         .forEach(
-            streamDocument ->
-                System.out.printf(
-                    "%s %s   %n", streamDocument.getExtraElements(), streamDocument.toString()));
+            sd -> {
+              System.out.printf(
+                  "OperationType %s. FullDocument %s %n",
+                  sd.getOperationType(),
+                  sd.getFullDocument() == null ? "" : sd.getFullDocument().toJson());
+            });
   }
 
   //   // 在Update场景下，com.mongodb.client.model.changestream.ChangeStreamDocument.getFullDocument空的场景是

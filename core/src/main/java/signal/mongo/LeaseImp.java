@@ -45,9 +45,6 @@ final class LeaseImp extends Lease {
             new Document("_id", leaseID)
                 .append("createAt", now)
                 .append("expireAt", now.plusSeconds(30)));
-
-    // TODO UnusedVariable
-    System.out.println(insertOneResult);
   }
 
   void postScopedEvent(Object event) {
@@ -69,7 +66,6 @@ final class LeaseImp extends Lease {
 
   private synchronized void doRevoke() {
     DeleteResult deleteResult = collection.deleteOne(eq("_id", this.id));
-    System.out.println(deleteResult);
   }
 
   @Override
