@@ -1,10 +1,10 @@
 {
-  "title": "Distribute Signal Tool",
+  "title": "Signal",
   "description": "The docs Distribute Signal",
   "icon": "Building",
   "root": true,
   "pages": [
-    "---Introduction---",
-    "index"
+    "rwlock",
+    "test"
   ]
 }

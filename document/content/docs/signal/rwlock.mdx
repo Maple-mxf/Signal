@@ -1,0 +1,49 @@
+---
+title: DistributeReadWriteLock
+description: 基于 MongoDB 实现的分布式读写锁工具类，为分布式系统提供线程安全的读写锁机制。该类允许多个节点在共享资源上进行协调，确保在高并发环境下的数据一致性和操作的原子性。
+---
+
+
+| Future | Description |
+| ----- | ----------- |
+| 公平性 | 非公平       |
+| 是否可重入 | 支持       |
+| 超时机制 | 支持       |
+|  续约机制 | 不支持       |
+|  锁的高可用实现机制 | 基于Lease续约实现       |
+
+## Usage
+
+### New Lock Instance
+
+```java title="core/src/test/java/ReadWriteLockTest.java"
+var client = MongoSignalClient.getInstance("mongodb://127.0.0.1:27017/signal");
+var lease = signalClient.grantLease(new LeaseCreateConfig());
+var lock = lease.getReadWriteLock("TestRWLockKey");
+```
+
+### Acquire ReadLock
+
+```java title="core/src/test/java/ReadWriteLockTest.java"
+var isLocked = lock.readLock().tryLock();
+try {
+    // something
+}finally{
+    if (isLocked) {
+        lock.readLock().unlock();
+    }
+}
+```
+
+### Acquire WriteLock
+
+```java title="core/src/test/java/ReadWriteLockTest.java"
+var isLocked = lock.writeLock().tryLock();
+try {
+    // something
+}finally{
+    if (isLocked) {
+        lock.writeLock().unlock();
+    }
+}
+```
