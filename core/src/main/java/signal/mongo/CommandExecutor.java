@@ -143,15 +143,18 @@ final class CommandExecutor<Doc> {
     // 在单个进程内部 顺序执行事务操作 避免CPU飙升
     synchronized (lockObj) {
       try (ClientSession session = mongoClient.startSession()) {
+        System.err.println("execute LoopCommand");
         T commandBody =
             session.withTransaction(() -> command.apply(session, collection), TRANSACTION_OPTIONS);
         return CommandResponse.ok(commandBody);
       } catch (MongoException dbError) {
         MongoErrorCode errCode = MongoErrorCode.fromException(dbError);
+        System.err.println("execute LoopCommand MongoErrorCode : "  + errCode);
         return dbErrorHandlePolicy != null
             ? dbErrorHandlePolicy.apply(dbError, errCode)
             : CommandResponse.dbError(false, errCode, dbError);
       } catch (Throwable unexpectedError) {
+        System.err.println("execute LoopCommand unexpectedError : "  + unexpectedError.getMessage());
         return unexpectedErrorHandlePolicy != null
             ? unexpectedErrorHandlePolicy.apply(unexpectedError)
             : CommandResponse.unexpectedError(unexpectedError, false);

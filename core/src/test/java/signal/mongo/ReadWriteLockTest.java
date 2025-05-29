@@ -19,25 +19,21 @@ public class ReadWriteLockTest extends Base {
 
   @Override
   public void doCloseResource() {
-    this.distributeReadWriteLock.close();
+    //    this.distributeReadWriteLock.close();
   }
 
   private Runnable newGrabWriteLockTask() {
     return () -> {
       int dur = new Random().nextInt(2, 4);
-      log.info(
-          "Thread {} start grab write lock. Now : {} Dur : {}",
-          Utils.getCurrentThreadName(),
-          System.nanoTime(),
-          dur);
       boolean locked = false;
       try {
         locked = distributeReadWriteLock.writeLock().tryLock();
 
         log.info(
-            "Thread {} grab write lock success. Now : {} ",
+            "Thread {} grab write lock success. Now : {}  Dur: {} ",
             Utils.getCurrentThreadName(),
-            System.nanoTime());
+            System.nanoTime(),
+            dur);
 
         TimeUnit.SECONDS.sleep(new Random().nextInt(2, 4));
 
@@ -59,18 +55,14 @@ public class ReadWriteLockTest extends Base {
     return () -> {
       int dur = new Random().nextInt(2, 4);
 
-      log.info(
-          "Thread {} start grab read lock. Now : {} Dur : {}",
-          Utils.getCurrentThreadName(),
-          System.nanoTime(),
-          dur);
       boolean locked = false;
       try {
         locked = distributeReadWriteLock.readLock().tryLock();
         log.info(
-            "Thread {} grab read lock success. Now : {} ",
+            "Thread {} grab read lock success. Now : {} dur {} ",
             Utils.getCurrentThreadName(),
-            System.nanoTime());
+            System.nanoTime(),
+            dur);
         TimeUnit.SECONDS.sleep(new Random().nextInt(2, 4));
       } catch (InterruptedException e) {
         throw new RuntimeException(e);
@@ -85,8 +77,11 @@ public class ReadWriteLockTest extends Base {
       }
     };
   }
-
-
+  @Test
+  public void testReadWriteLock2() throws InterruptedException {
+    Runnable grabWriteLockTask = newGrabWriteLockTask();
+    grabWriteLockTask.run();
+  }
   @Test
   public void testReadWriteLock() throws InterruptedException {
     Runnable grabWriteLockTask = newGrabWriteLockTask();

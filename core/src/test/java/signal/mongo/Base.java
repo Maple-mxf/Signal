@@ -16,7 +16,7 @@ public class Base {
 
   Lease lease;
 
-  Logger log = LoggerFactory.getLogger("Signal");
+  Logger log = LoggerFactory.getLogger("signal.mongo.Signal");
 
   public static String now() {
     ZonedDateTime now = Instant.now().atZone(ZoneId.of("GMT"));
