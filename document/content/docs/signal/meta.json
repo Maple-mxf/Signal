@@ -1,6 +1,6 @@
 {
-  "title": "Framework",
-  "description": "The docs framework",
+  "title": "Distribute Signal Tool",
+  "description": "The docs Distribute Signal",
   "icon": "Building",
   "root": true,
   "pages": [
