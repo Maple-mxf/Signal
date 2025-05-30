@@ -1,9 +1,8 @@
 name: Deploy Fumadocs (from /document) to GitHub Pages
 
 on:
-  push:
-    branches:
-      - master
+  workflow_dispatch:
+
 
 permissions:
   contents: write
