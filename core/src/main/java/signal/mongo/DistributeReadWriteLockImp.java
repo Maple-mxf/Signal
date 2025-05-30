@@ -272,10 +272,10 @@ public final class DistributeReadWriteLockImp extends DistributeMongoSignalBase<
       StatefulVar<LockStateObject> state1 =
           (StatefulVar<LockStateObject>) varHandle.getAcquire(this);
 
-      RWLockDocument lock = coll.find(session, eq("_id", this.getKey())).first();
-      if (lock == null) {
-        lock = new RWLockDocument(key, mode, List.of(thisOwner), 1L);
-        InsertOneResult insertOneResult = coll.insertOne(session, lock);
+      RWLockDocument rw = coll.find(session, eq("_id", this.getKey())).first();
+      if (rw == null) {
+        rw = new RWLockDocument(key, mode, List.of(thisOwner), 1L);
+        InsertOneResult insertOneResult = coll.insertOne(session, rw);
         boolean success =
             insertOneResult.getInsertedId() != null && insertOneResult.wasAcknowledged();
 
@@ -285,19 +285,19 @@ public final class DistributeReadWriteLockImp extends DistributeMongoSignalBase<
             success, !success, state1, new LockStateObject(mode, Set.of(thisOwner.hashCode())));
       }
 
-      if (nonRetryablePredicate.test(lock)) {
+      if (nonRetryablePredicate.test(rw)) {
         return new TryLockTxnResponse(
             false,
             false,
             state1,
             new LockStateObject(
-                lock.mode(),
-                lock.owners().stream()
+                rw.mode(),
+                rw.owners().stream()
                     .map(RWLockOwnerDocument::hashCode)
                     .collect(toUnmodifiableSet())));
       }
 
-      long version = lock.version(), newVersion = version + 1L;
+      long version = rw.version(), newVersion = version + 1L;
 
       List<Bson> condList = new ArrayList<>(8);
       condList.add(eq("_id", key));
@@ -306,7 +306,7 @@ public final class DistributeReadWriteLockImp extends DistributeMongoSignalBase<
       List<Bson> updateList = new ArrayList<>(8);
       updateList.add(inc("version", 1L));
 
-      if (reenterPredicate.test(lock)) {
+      if (reenterPredicate.test(rw)) {
         condList.add(eq("owners.hostname", thisOwner.hostname()));
         condList.add(eq("owners.lease", thisOwner.lease()));
         condList.add(eq("owners.thread", thisOwner.thread()));
@@ -316,12 +316,12 @@ public final class DistributeReadWriteLockImp extends DistributeMongoSignalBase<
         updateList.add(addToSet("owners", thisOwner));
       }
       boolean success =
-          (lock =
+          (rw =
                       coll.findOneAndUpdate(
                           session, and(condList), combine(updateList), UPDATE_OPTIONS))
                   != null
-              && lock.version() == newVersion
-              && lock.owners().contains(thisOwner);
+              && rw.version() == newVersion
+              && rw.owners().contains(thisOwner);
 
       log.info("try lock update success {} ", success);
 
@@ -331,8 +331,8 @@ public final class DistributeReadWriteLockImp extends DistributeMongoSignalBase<
           state1,
           success
               ? new LockStateObject(
-                  lock.mode(),
-                  lock.owners().stream()
+                  rw.mode(),
+                  rw.owners().stream()
                       .map(RWLockOwnerDocument::hashCode)
                       .collect(toUnmodifiableSet()))
               : null);
@@ -529,7 +529,7 @@ public final class DistributeReadWriteLockImp extends DistributeMongoSignalBase<
             "unlock method. mode {} safeUpdateState result {} thread {} ",
             mode,
             success,
-            Utils.getCurrentThreadName());
+            getCurrentThreadName());
       }
 
       if (rsp.unlockSuccess) break Next;
@@ -547,34 +547,34 @@ public final class DistributeReadWriteLockImp extends DistributeMongoSignalBase<
       StatefulVar<LockStateObject> currState =
           (StatefulVar<LockStateObject>) varHandle.getAcquire(this);
 
-      RWLockDocument lock = coll.find(session, eq("_id", key)).first();
+      RWLockDocument rw = coll.find(session, eq("_id", key)).first();
       RWLockOwnerDocument thatOwner =
-          Optional.ofNullable(lock)
+          Optional.ofNullable(rw)
               .map(RWLockDocument::owners)
               .flatMap(t -> t.stream().filter(thisOwner::equals).findFirst())
               .orElse(null);
 
-      if (lock == null || thatOwner == null) {
+      if (rw == null || thatOwner == null) {
         return new UnlockTxnResponse(
             false,
             false,
             String.format("The current instance does not hold a %s lock.", mode),
             true,
             currState,
-            (lock == null || lock.owners() == null)
+            (rw == null || rw.owners() == null)
                 ? null
                 : new LockStateObject(
-                    lock.mode(),
-                    lock.owners().stream()
+                    rw.mode(),
+                    rw.owners().stream()
                         .map(RWLockOwnerDocument::hashCode)
                         .collect(toUnmodifiableSet())));
       }
 
-      long version = lock.version(), newVersion = version + 1;
+      long version = rw.version(), newVersion = version + 1;
       Bson filter = and(eq("_id", key), eq("version", version));
 
       // 达到删除的条件
-      if (lock.owners().size() == 1 && thatOwner.enterCount() <= 1) {
+      if (rw.owners().size() == 1 && thatOwner.enterCount() <= 1) {
         DeleteResult deleteResult = coll.deleteOne(session, filter);
         boolean success = deleteResult.wasAcknowledged() && deleteResult.getDeletedCount() == 1L;
         return new UnlockTxnResponse(success, !success, null, success, currState, null);
@@ -601,22 +601,22 @@ public final class DistributeReadWriteLockImp extends DistributeMongoSignalBase<
       }
 
       boolean success =
-          (lock =
+          (rw =
                       coll.findOneAndUpdate(
                           session, and(filterList), combine(updateList), UPDATE_OPTIONS))
                   != null
-              && lock.version() == newVersion;
+              && rw.version() == newVersion;
       return new UnlockTxnResponse(
           success,
           !success,
           null,
           success,
           currState,
-          lock == null
+          rw == null
               ? null
               : new LockStateObject(
-                  lock.mode(),
-                  lock.owners().stream()
+                  rw.mode(),
+                  rw.owners().stream()
                       .map(RWLockOwnerDocument::hashCode)
                       .collect(toUnmodifiableSet())));
     };

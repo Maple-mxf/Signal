@@ -9,7 +9,6 @@ import static com.mongodb.client.model.Projections.include;
 import static com.mongodb.client.model.Updates.combine;
 import static com.mongodb.client.model.Updates.inc;
 import static com.mongodb.client.model.Updates.set;
-import static java.lang.System.identityHashCode;
 import static java.lang.System.nanoTime;
 import static java.util.Optional.ofNullable;
 import static java.util.concurrent.TimeUnit.NANOSECONDS;
@@ -87,20 +86,20 @@ public final class DistributeMutexLockImp extends DistributeMongoSignalBase<Mute
    * StatefulVar#value} 等于 null时，代表当前未有任何线程获取到锁
    */
   @Keep
-  @GuardedBy("lockOwnerVarHandle")
+  @GuardedBy("varHandle")
   @VisibleForTesting
-  StatefulVar<Integer> lockOwner;
+  StatefulVar<Integer> state;
 
-  private final VarHandle lockOwnerVarHandle;
+  private final VarHandle varHandle;
 
   public DistributeMutexLockImp(
       Lease lease, String key, MongoClient mongoClient, MongoDatabase db, EventBus eventBus) {
     super(lease, key, mongoClient, db, MUTEX_LOCK_NAMED);
-    this.lockOwner = new StatefulVar<>(null);
+    this.state = new StatefulVar<>(null);
     try {
-      lockOwnerVarHandle =
+      varHandle =
           MethodHandles.lookup()
-              .findVarHandle(DistributeMutexLockImp.class, "lockOwner", StatefulVar.class);
+              .findVarHandle(DistributeMutexLockImp.class, "state", StatefulVar.class);
     } catch (NoSuchFieldException | IllegalAccessException e) {
       throw new IllegalStateException();
     }
@@ -110,25 +109,24 @@ public final class DistributeMutexLockImp extends DistributeMongoSignalBase<Mute
     this.eventBus.register(this);
   }
 
-  private MutexLockOwnerDocument buildCurrentOwner(int enterCount) {
+  private MutexLockOwnerDocument buildCurrentOwner() {
     return new MutexLockOwnerDocument(
-        getCurrentHostname(), lease.getId(), getCurrentThreadName(), enterCount);
+        getCurrentHostname(), lease.getId(), getCurrentThreadName(), 1);
   }
 
   private record TryLockTxnResponse(boolean tryLockSuccess, boolean retryable) {}
 
   /**
-   * TODO 需要斟酌在TryLock函数内部是否有必要更新lockOwner的值,如果TryLock函数内部会更新LockOwner的值，
-   * TODO 则可能会带来mutex的enterCount字段的无限自增，在事物成功的情况但是变量更新失败的情况下会带来这个问题
+   * TODO 需要斟酌在TryLock函数内部是否有必要更新lockOwner的值,如果TryLock函数内部会更新LockOwner的值， TODO
+   * 则可能会带来mutex的enterCount字段的无限自增，在事物成功的情况但是变量更新失败的情况下会带来这个问题
    *
-   * <p>{@link DistributeMutexLockImp#lockOwner} == null,其他线程已经得到了锁，但未接受到ChangeStream事件
+   * <p>{@link DistributeMutexLockImp#state} == null,其他线程已经得到了锁，但未接受到ChangeStream事件
    *
-   * <p>第一种情况：tryLock 先更新了{@link DistributeMutexLockImp#lockOwner}的值，lockOwner != null, 线程成功挂起
+   * <p>第一种情况：tryLock 先更新了{@link DistributeMutexLockImp#state}的值，lockOwner != null, 线程成功挂起
    *
-   * <p>第二种情况：{@link
-   * DistributeMutexLockImp#awakeHead(ChangeEvents.MutexLockChangeEvent)} 先更新了{@link
-   * DistributeMutexLockImp#lockOwner} 的值，lockOwner != null, TryLock的线程更新{@link
-   * DistributeMutexLockImp#lockOwner}失败，重新进入TryLock进程
+   * <p>第二种情况：{@link DistributeMutexLockImp#awakeSuccessor(ChangeEvents.MutexLockChangeEvent)}
+   * 先更新了{@link DistributeMutexLockImp#state} 的值，lockOwner != null, TryLock的线程更新{@link
+   * DistributeMutexLockImp#state}失败，重新进入TryLock进程
    *
    * @param waitTime 等待时间
    * @param timeUnit 时间单位
@@ -138,7 +136,7 @@ public final class DistributeMutexLockImp extends DistributeMongoSignalBase<Mute
   @CheckReturnValue
   @Override
   public boolean tryLock(Long waitTime, TimeUnit timeUnit) throws InterruptedException {
-    MutexLockOwnerDocument thisOwner = buildCurrentOwner(1);
+    MutexLockOwnerDocument thisOwner = buildCurrentOwner();
     BiFunction<ClientSession, MongoCollection<MutexLockDocument>, TryLockTxnResponse> command =
         (session, coll) -> {
           MutexLockDocument mutex = coll.find(session, eq("_id", this.getKey())).first();
@@ -189,8 +187,7 @@ public final class DistributeMutexLockImp extends DistributeMongoSignalBase<Mute
               available,
               () -> {
                 @SuppressWarnings("unchecked")
-                StatefulVar<Integer> sv =
-                    (StatefulVar<Integer>) lockOwnerVarHandle.getAcquire(this);
+                StatefulVar<Integer> sv = (StatefulVar<Integer>) varHandle.getAcquire(this);
                 if (sv.value == null) return false;
                 return !sv.value.equals(thisOwner.hashCode());
               },
@@ -219,7 +216,7 @@ public final class DistributeMutexLockImp extends DistributeMongoSignalBase<Mute
 
   @Override
   public void unlock() {
-    MutexLockOwnerDocument thisOwner = buildCurrentOwner(1);
+    MutexLockOwnerDocument thisOwner = buildCurrentOwner();
     BiFunction<ClientSession, MongoCollection<MutexLockDocument>, CommonTxnResponse> command =
         (session, coll) -> {
           MutexLockDocument mutex = coll.find(session, eq("_id", key)).first();
@@ -275,7 +272,7 @@ public final class DistributeMutexLockImp extends DistributeMongoSignalBase<Mute
   @Override
   public boolean isHeldByCurrentThread() {
     checkState();
-    MutexLockOwnerDocument thisOwner = buildCurrentOwner(1);
+    MutexLockOwnerDocument thisOwner = buildCurrentOwner();
     BiFunction<ClientSession, MongoCollection<MutexLockDocument>, Boolean> command =
         (session, coll) ->
             coll.countDocuments(
@@ -314,21 +311,17 @@ public final class DistributeMutexLockImp extends DistributeMongoSignalBase<Mute
 
   @DoNotCall
   @Subscribe
-  void awakeHead(ChangeEvents.MutexLockChangeEvent event) {
+  void awakeSuccessor(ChangeEvents.MutexLockChangeEvent event) {
     if (!event.key().equals(this.getKey())) return;
     Next:
     for (; ; ) {
       @SuppressWarnings("unchecked")
-      StatefulVar<Integer> currLockOwnerState =
-          (StatefulVar<Integer>) lockOwnerVarHandle.getAcquire(this);
-      int currLockOwnerStateHashCode = identityHashCode(currLockOwnerState);
+      StatefulVar<Integer> currState = (StatefulVar<Integer>) varHandle.getAcquire(this);
 
       Document fullDocument = event.fullDocument();
       if (fullDocument == null) {
-        if (identityHashCode(
-                lockOwnerVarHandle.compareAndExchangeRelease(
-                    this, currLockOwnerState, new StatefulVar<Integer>(null)))
-            == currLockOwnerStateHashCode) {
+        if (varHandle.compareAndExchangeRelease(this, currState, new StatefulVar<Integer>(null))
+            == currState) {
           unparkSuccessor(lock, available, false);
           return;
         }
@@ -343,10 +336,9 @@ public final class DistributeMutexLockImp extends DistributeMongoSignalBase<Mute
                           t.getString("hostname"), t.getString("lease"), t.getString("thread"), 0))
               .map(MutexLockOwnerDocument::hashCode)
               .orElse(null);
-      if (identityHashCode(
-              lockOwnerVarHandle.compareAndExchangeRelease(
-                  this, currLockOwnerState, new StatefulVar<>(thatOwnerHashCode)))
-          == currLockOwnerStateHashCode) {
+      if (varHandle.compareAndExchangeRelease(
+              this, currState, new StatefulVar<Integer>(thatOwnerHashCode))
+          == currState) {
         unparkSuccessor(lock, available, false);
         return;
       }
@@ -360,8 +352,7 @@ public final class DistributeMutexLockImp extends DistributeMongoSignalBase<Mute
     BiFunction<ClientSession, MongoCollection<MutexLockDocument>, CommonTxnResponse> command =
         (session, coll) -> {
           MutexLockDocument mutex =
-              coll.find(
-                      session, and(eq("_id", this.getKey()), eq("owner.lease", lease.getId())))
+              coll.find(session, and(eq("_id", this.getKey()), eq("owner.lease", lease.getId())))
                   .first();
           if (mutex == null) return null;
           DeleteResult deleteResult =
