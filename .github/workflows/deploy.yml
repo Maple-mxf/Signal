@@ -17,43 +17,27 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  build:
+  build-and-deploy:
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: document
-    strategy:
-      matrix:
-        node-version: [18.x]
     steps:
-      - uses: actions/checkout@v4
-      - name: Install pnpm
-        uses: pnpm/action-setup@v4
-        with:
-          version: 8.6.0
-      - name: Use Node.js ${{ matrix.node-version }}
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: ${{ matrix.node-version }}
-          cache: 'pnpm'
-      - run: pnpm install
-        working-directory: document
-      - run: pnpm run build
-        working-directory: document
-      - name: Upload artifact
-        uses: actions/upload-pages-artifact@v3
-        with:
-          path: document/out
+          node-version: '20'  # 可按需修改 Node.js 版本
 
-  # 部署工作
-  deploy:
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-    needs: build
-    runs-on: ubuntu-latest
-    name: Deploy
-    steps:
+      - name: Install dependencies
+        run: npm ci
+        working-directory: document
+
+      - name: Build documentation
+        run: npm run build
+        working-directory: document
+
       - name: Deploy to GitHub Pages
-        id: deployment
-        uses: actions/deploy-pages@v4
+        uses: peaceiris/actions-gh-pages@v3
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: document/out  # 你文档构建的输出目录
