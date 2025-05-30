@@ -30,7 +30,7 @@ jobs:
       - name: Build and Export static site
         run: |
           npm run build
-          npm run export
+#          npm run export
 
       - name: Deploy to GitHub Pages
         uses: peaceiris/actions-gh-pages@v4
