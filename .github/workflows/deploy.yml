@@ -1,4 +1,4 @@
-name: Deploy Fumadocs (from /document) to GitHub Pages
+name: Deploy Fumadocs Page
 
 on:
   workflow_dispatch:
