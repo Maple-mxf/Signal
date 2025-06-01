@@ -20,11 +20,6 @@ public class ReadWriteLockTest extends Base {
     this.distributeReadWriteLock = lease.getReadWriteLock("Test");
   }
 
-  @Override
-  public void doCloseResource() {
-    //    this.distributeReadWriteLock.close();
-  }
-
   private Runnable newGrabWriteLockTask() {
     return () -> {
       int dur = new Random().nextInt(2, 4);

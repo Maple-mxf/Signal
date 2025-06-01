@@ -13,9 +13,6 @@ import static java.lang.System.nanoTime;
 import static java.util.Optional.ofNullable;
 import static java.util.concurrent.TimeUnit.NANOSECONDS;
 import static signal.mongo.CollectionNamed.MUTEX_LOCK_NAMED;
-import static signal.mongo.CommonTxnResponse.ok;
-import static signal.mongo.CommonTxnResponse.retryableError;
-import static signal.mongo.CommonTxnResponse.thrownAnError;
 import static signal.mongo.MongoErrorCode.DUPLICATE_KEY;
 import static signal.mongo.MongoErrorCode.NO_SUCH_TRANSACTION;
 import static signal.mongo.MongoErrorCode.WRITE_CONFLICT;
@@ -28,6 +25,7 @@ import com.google.auto.service.AutoService;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.eventbus.EventBus;
 import com.google.common.eventbus.Subscribe;
+import com.google.errorprone.annotations.CanIgnoreReturnValue;
 import com.google.errorprone.annotations.CheckReturnValue;
 import com.google.errorprone.annotations.DoNotCall;
 import com.google.errorprone.annotations.Keep;
@@ -114,7 +112,29 @@ public final class DistributeMutexLockImp extends DistributeMongoSignalBase<Mute
         getCurrentHostname(), lease.getId(), getCurrentThreadName(), 1);
   }
 
-  private record TryLockTxnResponse(boolean tryLockSuccess, boolean retryable) {}
+  @CanIgnoreReturnValue
+  private boolean safeUpdateState(StatefulVar<Integer> captureState, Integer newStateValue) {
+    StatefulVar<Integer> newState = new StatefulVar<>(newStateValue);
+    if (captureState.equals(newState)) return true;
+    return varHandle.compareAndExchangeRelease(
+            DistributeMutexLockImp.this, captureState, new StatefulVar<>(newStateValue))
+        == captureState;
+  }
+
+  private record TryLockTxnResponse(
+      boolean tryLockSuccess,
+      boolean retryable,
+      boolean cas,
+      StatefulVar<Integer> captureState,
+      Integer newStateValue) {}
+
+  private record UnlockTxnResponse(
+      boolean unlockSuccess,
+      boolean retryable,
+      String exceptionMessage,
+      boolean cas,
+      StatefulVar<Integer> captureState,
+      Integer newStateValue) {}
 
   /**
    * TODO 需要斟酌在TryLock函数内部是否有必要更新lockOwner的值,如果TryLock函数内部会更新LockOwner的值， TODO
@@ -139,20 +159,26 @@ public final class DistributeMutexLockImp extends DistributeMongoSignalBase<Mute
     MutexLockOwnerDocument thisOwner = buildCurrentOwner();
     BiFunction<ClientSession, MongoCollection<MutexLockDocument>, TryLockTxnResponse> command =
         (session, coll) -> {
+          @SuppressWarnings("unchecked")
+          StatefulVar<Integer> captureState = (StatefulVar<Integer>) varHandle.getAcquire(this);
+
           MutexLockDocument mutex = coll.find(session, eq("_id", this.getKey())).first();
           if (mutex == null) {
             mutex = new MutexLockDocument(key, thisOwner, 1L);
             InsertOneResult insertOneResult = coll.insertOne(session, mutex);
             boolean success =
                 insertOneResult.wasAcknowledged() && insertOneResult.getInsertedId() != null;
-            return new TryLockTxnResponse(success, !success);
+            return new TryLockTxnResponse(
+                success, !success, success, captureState, success ? thisOwner.hashCode() : null);
           }
 
           long version = mutex.version(), newVersion = version + 1;
 
           // 其他线程占用锁资源 挂起当前线程, 判断是否属于当前线程
           if (mutex.owner() != null) {
-            if (!mutex.owner().equals(thisOwner)) return new TryLockTxnResponse(false, false);
+            if (!mutex.owner().equals(thisOwner))
+              return new TryLockTxnResponse(
+                  false, false, true, captureState, mutex.owner().hashCode());
             mutex =
                 coll.findOneAndUpdate(
                     session,
@@ -160,7 +186,8 @@ public final class DistributeMutexLockImp extends DistributeMongoSignalBase<Mute
                     combine(inc("version", 1L), inc("owner.enter_count", 1)),
                     UPDATE_OPTIONS);
             boolean success = mutex != null && mutex.version() == newVersion;
-            return new TryLockTxnResponse(success, !success);
+            return new TryLockTxnResponse(
+                success, !success, success, captureState, success ? thisOwner.hashCode() : null);
           }
           mutex =
               coll.findOneAndUpdate(
@@ -170,7 +197,8 @@ public final class DistributeMutexLockImp extends DistributeMongoSignalBase<Mute
                   UPDATE_OPTIONS);
           boolean success =
               (mutex != null && mutex.version() == newVersion && thisOwner.equals(mutex.owner()));
-          return new TryLockTxnResponse(success, !success);
+          return new TryLockTxnResponse(
+              success, !success, success, captureState, success ? thisOwner.hashCode() : null);
         };
 
     long s = nanoTime(), waitTimeNanos = timeUnit.toNanos(waitTime);
@@ -206,6 +234,10 @@ public final class DistributeMutexLockImp extends DistributeMongoSignalBase<Mute
               timed,
               timed ? (waitTimeNanos - (nanoTime() - s)) : -1L,
               NANOSECONDS);
+
+      // 此处忽略CAS失败的情况
+      if (rsp.cas) safeUpdateState(rsp.captureState, rsp.newStateValue);
+
       if (rsp.tryLockSuccess) return true;
       if (rsp.retryable) {
         Thread.onSpinWait();
@@ -217,45 +249,63 @@ public final class DistributeMutexLockImp extends DistributeMongoSignalBase<Mute
   @Override
   public void unlock() {
     MutexLockOwnerDocument thisOwner = buildCurrentOwner();
-    BiFunction<ClientSession, MongoCollection<MutexLockDocument>, CommonTxnResponse> command =
+    BiFunction<ClientSession, MongoCollection<MutexLockDocument>, UnlockTxnResponse> command =
         (session, coll) -> {
+          @SuppressWarnings("unchecked")
+          StatefulVar<Integer> captureState = (StatefulVar<Integer>) varHandle.getAcquire(this);
+
           MutexLockDocument mutex = coll.find(session, eq("_id", key)).first();
           if (mutex == null || mutex.owner() == null || !mutex.owner().equals(thisOwner))
-            return thrownAnError("The current instance does not hold a mutex lock.");
+            return new UnlockTxnResponse(
+                false,
+                false,
+                "The current instance does not hold a mutex lock.",
+                false,
+                captureState,
+                null);
 
           MutexLockOwnerDocument thatOwner = mutex.owner();
           if (thatOwner.enterCount() <= 1) {
             DeleteResult deleteResult =
                 coll.deleteOne(session, and(eq("_id", key), eq("version", mutex.version())));
-            return deleteResult.wasAcknowledged() && deleteResult.getDeletedCount() == 1L
-                ? ok()
-                : retryableError();
+            boolean success =
+                deleteResult.wasAcknowledged() && deleteResult.getDeletedCount() == 1L;
+            return new UnlockTxnResponse(success, !success, null, success, captureState, null);
           }
           long version = mutex.version(), newVersion = version + 1L;
-          mutex =
-              coll.findOneAndUpdate(
-                  session,
-                  and(eq("_id", key), eq("version", version)),
-                  combine(inc("version", 1L), inc("owner.enter_count", -1)),
-                  UPDATE_OPTIONS);
-          return (mutex != null && mutex.version() == newVersion) ? ok() : retryableError();
+
+          boolean success =
+              (mutex =
+                          coll.findOneAndUpdate(
+                              session,
+                              and(eq("_id", key), eq("version", version)),
+                              combine(inc("version", 1L), inc("owner.enter_count", -1)),
+                              UPDATE_OPTIONS))
+                      != null
+                  && mutex.version() == newVersion;
+          return new UnlockTxnResponse(
+              success,
+              !success,
+              null,
+              success,
+              captureState,
+              mutex == null ? null : mutex.owner().hashCode());
         };
 
     Next:
     for (; ; ) {
       checkState();
-      CommonTxnResponse rsp =
+      UnlockTxnResponse rsp =
           commandExecutor.loopExecute(
               command,
               commandExecutor.defaultDBErrorHandlePolicy(NO_SUCH_TRANSACTION, WRITE_CONFLICT),
               null,
-              t -> !t.txnOk && t.retryable && !t.thrownError);
-      if (rsp.thrownError) throw new SignalException(rsp.message);
-      if (rsp.txnOk) break Next;
-      if (rsp.retryable) {
-        Thread.onSpinWait();
-        continue Next;
-      }
+              t -> !t.unlockSuccess && t.retryable);
+
+      if (rsp.unlockSuccess) break Next;
+      if (rsp.exceptionMessage != null && !rsp.exceptionMessage.isEmpty())
+        throw new SignalException(rsp.exceptionMessage);
+      Thread.onSpinWait();
     }
   }
 
@@ -265,8 +315,7 @@ public final class DistributeMutexLockImp extends DistributeMongoSignalBase<Mute
     BiFunction<ClientSession, MongoCollection<MutexLockDocument>, Boolean> command =
         (session, coll) ->
             coll.countDocuments(session, and(eq("_id", this.getKey()), exists("owner", true))) > 0L;
-    return commandExecutor.loopExecute(
-        command, commandExecutor.defaultDBErrorHandlePolicy(NO_SUCH_TRANSACTION));
+    return commandExecutor.loopExecute(command);
   }
 
   @Override
@@ -283,8 +332,7 @@ public final class DistributeMutexLockImp extends DistributeMongoSignalBase<Mute
                         eq("owner.lease", thisOwner.lease()),
                         eq("owner.thread", thisOwner.thread())))
                 > 0L;
-    return commandExecutor.loopExecute(
-        command, commandExecutor.defaultDBErrorHandlePolicy(NO_SUCH_TRANSACTION));
+    return commandExecutor.loopExecute(command);
   }
 
   @Override
@@ -298,8 +346,7 @@ public final class DistributeMutexLockImp extends DistributeMongoSignalBase<Mute
                   .first();
           return mutex == null ? null : mutex.owner();
         };
-    return commandExecutor.loopExecute(
-        command, commandExecutor.defaultDBErrorHandlePolicy(NO_SUCH_TRANSACTION));
+    return commandExecutor.loopExecute(command);
   }
 
   @Override
@@ -316,12 +363,11 @@ public final class DistributeMutexLockImp extends DistributeMongoSignalBase<Mute
     Next:
     for (; ; ) {
       @SuppressWarnings("unchecked")
-      StatefulVar<Integer> currState = (StatefulVar<Integer>) varHandle.getAcquire(this);
+      StatefulVar<Integer> captureState = (StatefulVar<Integer>) varHandle.getAcquire(this);
 
       Document fullDocument = event.fullDocument();
       if (fullDocument == null) {
-        if (varHandle.compareAndExchangeRelease(this, currState, new StatefulVar<Integer>(null))
-            == currState) {
+        if (safeUpdateState(captureState, null)) {
           unparkSuccessor(lock, available, false);
           return;
         }
@@ -333,12 +379,13 @@ public final class DistributeMutexLockImp extends DistributeMongoSignalBase<Mute
               .map(
                   t ->
                       new MutexLockOwnerDocument(
-                          t.getString("hostname"), t.getString("lease"), t.getString("thread"), 0))
+                          t.getString("hostname"),
+                          t.getString("lease"),
+                          t.getString("thread"),
+                          t.getInteger("enter_count")))
               .map(MutexLockOwnerDocument::hashCode)
               .orElse(null);
-      if (varHandle.compareAndExchangeRelease(
-              this, currState, new StatefulVar<Integer>(thatOwnerHashCode))
-          == currState) {
+      if (safeUpdateState(captureState, thatOwnerHashCode)) {
         unparkSuccessor(lock, available, false);
         return;
       }
@@ -347,34 +394,24 @@ public final class DistributeMutexLockImp extends DistributeMongoSignalBase<Mute
     }
   }
 
-  // TODO Force Unlock API
   private void forceUnlock() {
-    BiFunction<ClientSession, MongoCollection<MutexLockDocument>, CommonTxnResponse> command =
+    BiFunction<ClientSession, MongoCollection<MutexLockDocument>, Boolean> command =
         (session, coll) -> {
           MutexLockDocument mutex =
               coll.find(session, and(eq("_id", this.getKey()), eq("owner.lease", lease.getId())))
                   .first();
-          if (mutex == null) return null;
+          if (mutex == null) return true;
           DeleteResult deleteResult =
               coll.deleteOne(
                   session, and(eq("_id", this.getKey()), eq("version", mutex.version())));
-          return deleteResult.getDeletedCount() == 1L ? ok() : retryableError();
+          return deleteResult.getDeletedCount() == 1L && deleteResult.wasAcknowledged();
         };
 
-    Next:
-    for (; ; ) {
-      CommonTxnResponse rsp =
-          commandExecutor.loopExecute(
-              command,
-              commandExecutor.defaultDBErrorHandlePolicy(NO_SUCH_TRANSACTION, WRITE_CONFLICT),
-              null,
-              t -> !t.txnOk && t.retryable);
-      if (rsp.txnOk) break Next;
-      if (rsp.retryable) {
-        Thread.onSpinWait();
-        continue Next;
-      }
-      if (rsp.thrownError) throw new SignalException(rsp.message);
-    }
+    Boolean forceUnlockRsp =
+        commandExecutor.loopExecute(
+            command,
+            commandExecutor.defaultDBErrorHandlePolicy(NO_SUCH_TRANSACTION, WRITE_CONFLICT),
+            null,
+            t -> !t);
   }
 }

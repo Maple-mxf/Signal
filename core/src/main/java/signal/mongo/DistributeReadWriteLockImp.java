@@ -185,6 +185,7 @@ public final class DistributeReadWriteLockImp extends DistributeMongoSignalBase<
     readLock.close();
     writeLock.close();
     unparkSuccessor(lock, writeLockAvailable, true);
+    unparkSuccessor(lock, readLockAvailable, true);
     forceUnlock();
   }
 
@@ -202,9 +203,9 @@ public final class DistributeReadWriteLockImp extends DistributeMongoSignalBase<
       boolean unlockSuccess,
       boolean retryable,
       String exceptionMessage,
-      boolean casUpdateState,
+      boolean cas,
       StatefulVar<LockStateObject> captureState,
-      LockStateObject newObj) {}
+      LockStateObject newStateValue) {}
 
   @ThreadSafe
   @AutoService(DistributeWriteLock.class)
@@ -269,7 +270,7 @@ public final class DistributeReadWriteLockImp extends DistributeMongoSignalBase<
           Predicate<RWLockDocument> reenterPredicate) {
     return (session, coll) -> {
       @SuppressWarnings("unchecked")
-      StatefulVar<LockStateObject> state1 =
+      StatefulVar<LockStateObject> captureState =
           (StatefulVar<LockStateObject>) varHandle.getAcquire(this);
 
       RWLockDocument rw = coll.find(session, eq("_id", this.getKey())).first();
@@ -278,18 +279,18 @@ public final class DistributeReadWriteLockImp extends DistributeMongoSignalBase<
         InsertOneResult insertOneResult = coll.insertOne(session, rw);
         boolean success =
             insertOneResult.getInsertedId() != null && insertOneResult.wasAcknowledged();
-
-        log.info("try lock insertOneResult {} success {} ", insertOneResult, success);
-
         return new TryLockTxnResponse(
-            success, !success, state1, new LockStateObject(mode, Set.of(thisOwner.hashCode())));
+            success,
+            !success,
+            captureState,
+            new LockStateObject(mode, Set.of(thisOwner.hashCode())));
       }
 
       if (nonRetryablePredicate.test(rw)) {
         return new TryLockTxnResponse(
             false,
             false,
-            state1,
+            captureState,
             new LockStateObject(
                 rw.mode(),
                 rw.owners().stream()
@@ -316,9 +317,7 @@ public final class DistributeReadWriteLockImp extends DistributeMongoSignalBase<
         updateList.add(addToSet("owners", thisOwner));
       }
       boolean success =
-          (rw =
-                      coll.findOneAndUpdate(
-                          session, and(condList), combine(updateList), UPDATE_OPTIONS))
+          (rw = coll.findOneAndUpdate(session, and(condList), combine(updateList), UPDATE_OPTIONS))
                   != null
               && rw.version() == newVersion
               && rw.owners().contains(thisOwner);
@@ -328,7 +327,7 @@ public final class DistributeReadWriteLockImp extends DistributeMongoSignalBase<
       return new TryLockTxnResponse(
           success,
           !success,
-          state1,
+          captureState,
           success
               ? new LockStateObject(
                   rw.mode(),
@@ -353,6 +352,7 @@ public final class DistributeReadWriteLockImp extends DistributeMongoSignalBase<
 
     for (; ; ) {
       checkState();
+
       boolean elapsed =
           parkCurrentThreadUntil(
               lock,
@@ -367,11 +367,12 @@ public final class DistributeReadWriteLockImp extends DistributeMongoSignalBase<
               timed,
               startNanos,
               (waitTimeNanos - (nanoTime() - startNanos)));
-
       if (!elapsed) {
         log.warn("Timeout.");
         return false;
       }
+
+      checkState();
 
       BiFunction<ClientSession, MongoCollection<RWLockDocument>, TryLockTxnResponse> command =
           this.buildLockTxnCommand(thisOwner, mode, nonRetryablePredicate, reenterPredicate);
@@ -387,12 +388,7 @@ public final class DistributeReadWriteLockImp extends DistributeMongoSignalBase<
               timed ? (waitTimeNanos - (nanoTime() - startNanos)) : -1L,
               NANOSECONDS);
 
-      boolean success = safeUpdateState(rsp.captureState, rsp.newObj);
-      log.info(
-          "lock method. mode {} safeUpdateState result {} thread {} ",
-          mode,
-          success,
-          Utils.getCurrentThreadName());
+      safeUpdateState(rsp.captureState, rsp.newObj);
       if (rsp.tryLockSuccess) {
         if (mode.equals(READ)) {
           unparkSuccessor(lock, available, false);
@@ -452,27 +448,27 @@ public final class DistributeReadWriteLockImp extends DistributeMongoSignalBase<
     @Override
     public Collection<?> getParticipants() {
       BiFunction<ClientSession, MongoCollection<RWLockDocument>, Collection<?>> command =
-              (session, coll) -> {
-                List<RWLockOwnerDocument> owners = new ArrayList<>(4);
-                coll.aggregate(
-                                session,
-                                List.of(
-                                        match(and(eq("_id", key), eq("mode", READ), type("owners", BsonType.ARRAY))),
-                                        unwind("$owners"),
-                                        project(
-                                                fields(
-                                                        computed("hostname", "$owners.hostname"),
-                                                        computed("lease", "$owners.lease"),
-                                                        computed("thread", "$owners.thread"),
-                                                        computed("enter_count", "$owners.enter_count")))),
-                                RWLockOwnerDocument.class)
-                        .into(owners);
-                return owners;
-              };
+          (session, coll) -> {
+            List<RWLockOwnerDocument> owners = new ArrayList<>(4);
+            coll.aggregate(
+                    session,
+                    List.of(
+                        match(
+                            and(eq("_id", key), eq("mode", READ), type("owners", BsonType.ARRAY))),
+                        unwind("$owners"),
+                        project(
+                            fields(
+                                computed("hostname", "$owners.hostname"),
+                                computed("lease", "$owners.lease"),
+                                computed("thread", "$owners.thread"),
+                                computed("enter_count", "$owners.enter_count")))),
+                    RWLockOwnerDocument.class)
+                .into(owners);
+            return owners;
+          };
       return commandExecutor.loopExecute(command);
     }
   }
-
 
   private boolean execIsLockedTxnCommand(RWLockMode mode) {
     // $mode == mode && $owners.length() > 0
@@ -523,14 +519,7 @@ public final class DistributeReadWriteLockImp extends DistributeMongoSignalBase<
                       && t.retryable
                       && (t.exceptionMessage == null || t.exceptionMessage.isEmpty()));
 
-      if (rsp.casUpdateState) {
-        boolean success = safeUpdateState(rsp.captureState, rsp.newObj);
-        log.info(
-            "unlock method. mode {} safeUpdateState result {} thread {} ",
-            mode,
-            success,
-            getCurrentThreadName());
-      }
+      if (rsp.cas) safeUpdateState(rsp.captureState, rsp.newStateValue);
 
       if (rsp.unlockSuccess) break Next;
       if (rsp.exceptionMessage != null && !rsp.exceptionMessage.isEmpty())
@@ -680,11 +669,6 @@ public final class DistributeReadWriteLockImp extends DistributeMongoSignalBase<
             log.info("awake successor safeUpdateState 2 null success. ");
             return;
           }
-
-          log.info(
-              "awake method[DELETE].  safeUpdateState failure thread {} ",
-              Utils.getCurrentThreadName());
-
           Thread.onSpinWait();
           continue Next;
         }
@@ -706,16 +690,8 @@ public final class DistributeReadWriteLockImp extends DistributeMongoSignalBase<
         RWLockMode mode = RWLockMode.valueOf(fullDocument.getString("mode"));
         if (safeUpdateState(currLockState, new LockStateObject(mode, ownerHashCodeList))) {
           if (mode == READ) readLockAvailable.signal();
-          log.info(
-              "awake successor safeUpdateState success. mode {} ownerHashCodeList {} ",
-              mode,
-              ownerHashCodeList);
           return;
         }
-
-        log.info(
-            "awake method[UPDATE].  safeUpdateState failure thread {} ",
-            Utils.getCurrentThreadName());
         Thread.onSpinWait();
         continue Next;
       }

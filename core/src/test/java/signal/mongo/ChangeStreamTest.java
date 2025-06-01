@@ -39,7 +39,7 @@ public class ChangeStreamTest {
   @Test
   public void testWatchTransactionChange2() throws InterruptedException {
     // 集合监听
-    db.getCollection("signal_rw_lock")
+    db.getCollection("signal_mutex_lock")
         .watch(Document.class)
         .fullDocument(FullDocument.UPDATE_LOOKUP)
         .showExpandedEvents(true)
