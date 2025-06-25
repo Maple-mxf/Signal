@@ -195,7 +195,12 @@ public abstract class DistributeExclusiveBase<Doc> extends DistributeMongoSignal
           return new ConditionSignalTxnResponse(false, false, new IllegalMonitorStateException());
 
         ConditionDocument conditionDocument = lockAndCondition.condition;
-        if (conditionDocument == null || conditionDocument.waiters())
+        if (conditionDocument == null
+            || conditionDocument.waiters() == null
+            || conditionDocument.waiters().isEmpty()) {
+          return new ConditionSignalTxnResponse(false, false, new IllegalMonitorStateException());
+        }
+
       };
     }
 
