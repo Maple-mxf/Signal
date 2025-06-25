@@ -51,4 +51,10 @@ public class VarHandleTest {
   public void testCompareAndRelease() {
     new InnerClass().run();
   }
+
+  public static void main(String[] args){
+    System.err.println(true | true);
+    System.err.println(true | false);
+    System.err.println(false | false);
+  }
 }

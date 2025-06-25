@@ -20,6 +20,8 @@ abstract class DistributeMongoSignalBase<Doc> extends DistributeSignalBase {
 
   final TypeToken<Doc> documentTypeToken;
 
+  final MongoDatabase db;
+
   final MongoCollection<Doc> collection;
 
   static final TransactionOptions TRANSACTION_OPTIONS =
@@ -44,6 +46,7 @@ abstract class DistributeMongoSignalBase<Doc> extends DistributeSignalBase {
     super(lease, key);
     this.closed = false;
     this.mongoClient = mongoClient;
+    this.db = db;
     this.documentTypeToken = new TypeToken<>(getClass()) {};
     this.collection =
         (MongoCollection<Doc>) db.getCollection(collectionName, documentTypeToken.getRawType());
